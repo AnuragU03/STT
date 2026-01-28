@@ -315,7 +315,7 @@
                         Supported formats: any audio file (max 4MB on Vercel)
                     </p>
                 </div>
-                <input type="file" id="fileInput" class="file-input" accept="audio/*">
+                <input type="file" id="fileInput" class="file-input" accept="audio/*,video/mp4">
                 
                 <div class="file-info" id="fileInfo"></div>
                 
@@ -409,9 +409,10 @@
 
             // Validate file type
             const isAudio = file.type && file.type.startsWith('audio/');
+            const isMp4Video = file.type === 'video/mp4';
 
-            if (!isAudio) {
-                showError('Please upload a valid audio file');
+            if (!isAudio && !isMp4Video) {
+                showError('Please upload a valid audio file (audio/*) or MP4');
                 return;
             }
 

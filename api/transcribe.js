@@ -3,7 +3,8 @@ const fs = require("fs");
 const FormData = require("form-data");
 
 const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4MB (Vercel payload limit)
-const ALLOWED_MIME_TYPES = "audio/";
+const ALLOWED_AUDIO_PREFIX = "audio/";
+const ALLOWED_VIDEO_TYPES = new Set(["video/mp4"]);
 
 module.exports = async function handler(req, res) {
     if (req.method !== "POST") {
@@ -39,9 +40,13 @@ module.exports = async function handler(req, res) {
         }
 
         const uploaded = Array.isArray(file) ? file[0] : file;
-        if (!uploaded.mimetype || !uploaded.mimetype.startsWith(ALLOWED_MIME_TYPES)) {
+        if (
+            !uploaded.mimetype ||
+            (!uploaded.mimetype.startsWith(ALLOWED_AUDIO_PREFIX) &&
+                !ALLOWED_VIDEO_TYPES.has(uploaded.mimetype))
+        ) {
             return res.status(400).json({
-                detail: "Unsupported file type. Please upload an audio file",
+                detail: "Unsupported file type. Please upload an audio file or MP4",
             });
         }
 

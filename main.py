@@ -70,6 +70,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
             model="whisper-1",
             file=(file.filename or "audio", data, file.content_type),
             response_format="verbose_json",
+            language="en",
             timestamp_granularities=["word"],
         )
     except Exception as exc:  # pragma: no cover - passthrough

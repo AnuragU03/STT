@@ -312,10 +312,10 @@
                         Choose File
                     </button>
                     <p style="margin-top: 20px; color: #999; font-size: 0.9rem;">
-                        Supported formats: .wav, .mp3 (max 4MB on Vercel)
+                        Supported formats: any audio file (max 4MB on Vercel)
                     </p>
                 </div>
-                <input type="file" id="fileInput" class="file-input" accept=".wav,.mp3,.m4a,.webm">
+                <input type="file" id="fileInput" class="file-input" accept="audio/*">
                 
                 <div class="file-info" id="fileInfo"></div>
                 
@@ -408,12 +408,10 @@
             if (!file) return;
 
             // Validate file type
-            const validTypes = ['audio/wav', 'audio/mpeg', 'audio/mp3', 'audio/x-wav', 'audio/x-m4a', 'audio/webm'];
-            const validExtensions = ['.wav', '.mp3', '.m4a', '.webm'];
-            const hasValidExtension = validExtensions.some(ext => file.name.toLowerCase().endsWith(ext));
+            const isAudio = file.type && file.type.startsWith('audio/');
 
-            if (!validTypes.includes(file.type) && !hasValidExtension) {
-                showError('Please upload a valid audio file (.wav, .mp3, .m4a, .webm)');
+            if (!isAudio) {
+                showError('Please upload a valid audio file');
                 return;
             }
 

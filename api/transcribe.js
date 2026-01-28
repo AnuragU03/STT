@@ -12,6 +12,16 @@ module.exports = async function handler(req, res) {
         return res.status(405).json({ detail: "Method not allowed" });
     }
 
+    const contentType = req.headers["content-type"] || "";
+    if (!contentType.includes("multipart/form-data")) {
+        return res.status(400).json({ detail: "Expected multipart/form-data" });
+    }
+
+    const contentLength = Number(req.headers["content-length"] || 0);
+    if (contentLength && contentLength > MAX_FILE_SIZE) {
+        return res.status(413).json({ detail: "File too large. Max 4MB on Vercel." });
+    }
+
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
         return res.status(500).json({ detail: "OPENAI_API_KEY is not set" });
@@ -91,7 +101,7 @@ module.exports = async function handler(req, res) {
             words,
         });
     } catch (err) {
-        const message = err?.message || "Transcription failed";
+        const message = err?.message || "Could not parse multipart form";
         return res.status(500).json({ detail: message });
     }
 };

@@ -312,7 +312,7 @@
                         Choose File
                     </button>
                     <p style="margin-top: 20px; color: #999; font-size: 0.9rem;">
-                        Supported formats: .wav, .mp3 (max 25MB)
+                        Supported formats: .wav, .mp3 (max 4MB on Vercel)
                     </p>
                 </div>
                 <input type="file" id="fileInput" class="file-input" accept=".wav,.mp3,.m4a,.webm">
@@ -417,9 +417,9 @@
                 return;
             }
 
-            // Validate file size (25MB)
-            if (file.size > 25 * 1024 * 1024) {
-                showError('File is too large. Maximum size is 25MB.');
+            // Validate file size (Vercel payload limit ~4.5MB)
+            if (file.size > 4 * 1024 * 1024) {
+                showError('File is too large. Maximum size is 4MB on Vercel.');
                 return;
             }
 
@@ -458,26 +458,27 @@
                     body: formData
                 });
 
-                if (!response.ok) {
-                    let errorMessage = 'Transcription failed';
+                const responseText = await response.text();
+                let data = null;
+                if (responseText) {
                     try {
-                        const errorData = await response.json();
-                        errorMessage = errorData.detail || errorMessage;
+                        data = JSON.parse(responseText);
                     } catch (parseError) {
-                        const errorText = await response.text();
-                        if (errorText) {
-                            errorMessage = errorText;
-                        }
+                        data = null;
                     }
+                }
+
+                if (!response.ok) {
+                    const errorMessage =
+                        data?.detail ||
+                        data?.error?.message ||
+                        responseText ||
+                        'Transcription failed';
                     throw new Error(errorMessage);
                 }
 
-                let data;
-                try {
-                    data = await response.json();
-                } catch (parseError) {
-                    const fallbackText = await response.text();
-                    throw new Error(fallbackText || 'Invalid response from server');
+                if (!data) {
+                    throw new Error('Invalid response from server');
                 }
 
                 // Display results

@@ -2,7 +2,7 @@ const formidable = require("formidable");
 const fs = require("fs");
 const FormData = require("form-data");
 
-const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
+const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4MB (Vercel payload limit)
 const ALLOWED_MIME_TYPES = new Set([
     "audio/wav",
     "audio/x-wav",

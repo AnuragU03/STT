@@ -4,7 +4,12 @@ from typing import List, Optional
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
 ALLOWED_MIME_TYPES = {
@@ -15,6 +20,15 @@ ALLOWED_MIME_TYPES = {
     "audio/x-m4a",
     "audio/webm",
     "audio/mp4",
+    "audio/ogg",
+    "audio/flac",
+    "audio/aac",
+    "video/mp4",
+    "video/mpeg",
+    "video/webm",
+    "video/ogg",
+    "video/quicktime",  # .mov
+    "video/x-msvideo",  # .avi
 }
 
 app = FastAPI(title="Speech-to-Text API", version="1.0.0")
@@ -35,7 +49,7 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
-@app.get("/")
+@app.get("/api/info")
 def root():
     return {
         "status": "ok",
@@ -108,3 +122,17 @@ async def transcribe_audio(file: UploadFile = File(...)):
         "words": words,
     }
     return JSONResponse(content=payload)
+
+
+# Serve React Frontend (must be last)
+# We check if the static directory exists to avoid errors during local dev if build is missing
+import os
+if os.path.exists("static"):
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
+
+@app.exception_handler(404)
+async def custom_404_handler(_, __):
+    # For SPA routing, return index.html for unknown paths if static exists
+    if os.path.exists("static/index.html"):
+        return FileResponse("static/index.html")
+    return JSONResponse({"detail": "Not Founds"}, status_code=404)

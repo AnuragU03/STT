@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+    .glass {
+        @apply bg-white/10 backdrop-blur-lg border border-white/20 shadow-xl;
+    }
+}
+
+body {
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    color: #fff;
+    min-height: 100vh;
+}

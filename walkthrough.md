@@ -71,7 +71,31 @@ If you install Node.js (v20+), you can run the frontend locally:
     ```
 2.  **Frontend**:
     ```bash
-    cd client
-    npm install
-    npm run dev
     ```
+
+## 🧪 How to Test
+
+### 1. Web Dashboard (User Flow)
+1.  Open your App URL.
+2.  Click **"New Recording"**.
+3.  Upload an audio file (e.g., MP3/WAV).
+4.  You will be redirected to the **Dashboard**.
+5.  Watch the status change from `processing` -> `completed`.
+6.  Click the meeting to see the **Transcript** and **AI Summary**.
+
+### 2. Hardware Simulation (API Flow)
+To simulate your hardware device uploading a file, run this command in your terminal:
+
+**PowerShell:**
+```powershell
+$uri = "https://stt-premium-app.redbeach-eaccae08.centralindia.azurecontainerapps.io/api/upload-hardware"
+$filePath = "C:\path\to\test_audio.mp3"
+Invoke-RestMethod -Uri $uri -Method Post -InFile $filePath -ContentType "multipart/form-data"
+```
+
+**Curl (Linux/Mac):**
+```bash
+curl -X POST -F "file=@test_audio.mp3" https://stt-premium-app.redbeach-eaccae08.centralindia.azurecontainerapps.io/api/upload-hardware
+```
+
+After running this, refresh your Dashboard. You should see the new file processing!

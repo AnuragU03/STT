@@ -1,0 +1,45 @@
+{
+    "manifest_version": 3,
+    "name": "SonicScribe Meeting Recorder",
+    "version": "1.0",
+    "description": "Record online meetings and upload to SonicScribe for AI transcription.",
+    "permissions": [
+        "tabCapture",
+        "offscreen",
+        "storage",
+        "activeTab",
+        "scripting"
+    ],
+    "host_permissions": [
+        "*://meet.google.com/*",
+        "*://zoom.us/*",
+        "*://teams.microsoft.com/*",
+        "https://stt-premium-app.redbeach-eaccae08.centralindia.azurecontainerapps.io/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "action": {
+        "default_popup": "popup.html",
+        "default_icon": {
+            "16": "icons/icon16.png",
+            "48": "icons/icon48.png",
+            "128": "icons/icon128.png"
+        }
+    },
+    "icons": {
+        "16": "icons/icon16.png",
+        "48": "icons/icon48.png",
+        "128": "icons/icon128.png"
+    },
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "offscreen.html"
+            ],
+            "matches": [
+                "<all_urls>"
+            ]
+        }
+    ]
+}

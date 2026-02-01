@@ -51,10 +51,12 @@ az acr login --name $ACR_NAME
 # Build
 $IMAGE_TAG = "$ACR_SERVER/$($APP_NAME):v$(Get-Date -Format "yyyyMMddHHmm")"
 docker build --no-cache -t $IMAGE_TAG .
+if ($LASTEXITCODE -ne 0) { Write-Error "Docker Build Failed"; exit 1 }
 
 # Push
 Write-Host "4. Pushing Image to Azure..." -ForegroundColor Cyan
 docker push $IMAGE_TAG
+if ($LASTEXITCODE -ne 0) { Write-Error "Docker Push Failed"; exit 1 }
 
 # 4.1 Create Container App Environment (Explicitly to ensure safe region)
 Write-Host "4.1 Ensuring Container Environment exists in $LOCATION..." -ForegroundColor Cyan
@@ -75,7 +77,8 @@ if ($appExists) {
         --name $APP_NAME `
         --resource-group $RESOURCE_GROUP `
         --image $IMAGE_TAG
-} else {
+}
+else {
     Write-Host "   Creating new app..."
     az containerapp create `
         --name $APP_NAME `
@@ -93,6 +96,7 @@ az containerapp revision restart --name $APP_NAME --resource-group $RESOURCE_GRO
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "✅ Deployment Successful!" -ForegroundColor Green
-} else {
+}
+else {
     Write-Error "Deployment failed."
 }

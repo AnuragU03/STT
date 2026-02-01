@@ -98,4 +98,26 @@ Invoke-RestMethod -Uri $uri -Method Post -InFile $filePath -ContentType "multipa
 curl -X POST -F "file=@test_audio.mp3" https://stt-premium-app.redbeach-eaccae08.centralindia.azurecontainerapps.io/api/upload-hardware
 ```
 
-After running this, refresh your Dashboard. You should see the new file processing!
+
+### 3. Chrome Extension (The "Auto" Flow)
+The best way to record meetings (Google Meet, Zoom, etc.) is using the custom extension we built.
+
+**Installation:**
+1.  Open Chrome and go to `chrome://extensions`.
+2.  Enable **Developer Mode** (top right toggle).
+3.  Click **Load unpacked**.
+4.  Navigate to your project folder: `C:\Users\arunu\STT\extension` and select it.
+
+**Usage:**
+1.  Join a Google Meet or Zoom call.
+2.  Click the **SonicScribe Icon** in your toolbar.
+3.  Click **🔴 Start Recording**.
+4.  Select the **Tab** you want to record (usually the current meeting tab) and ensure **"Share tab audio"** is checked.
+5.  When the meeting ends, click **⏹ Stop Recording**.
+6.  The extension will automatically upload the audio to the cloud.
+7.  Check your Dashboard to see the new meeting processing!
+
+### 4. Audio Playback
+Once a meeting is processed, you can play back the audio directly in the browser:
+1.  Go to a meeting detail page.
+2.  Use the built-in audio player in the sidebar to listen to the recording.

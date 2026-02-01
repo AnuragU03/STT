@@ -1,38 +1,26 @@
 import os
+import shutil
+import uuid
 from typing import List, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from openai import OpenAI
+from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
+import models
+import database
+import ai_engine
+
+# Load env
 load_dotenv()
 
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
-ALLOWED_MIME_TYPES = {
-    "audio/wav",
-    "audio/x-wav",
-    "audio/mpeg",
-    "audio/mp3",
-    "audio/x-m4a",
-    "audio/webm",
-    "audio/mp4",
-    "audio/ogg",
-    "audio/flac",
-    "audio/aac",
-    "video/mp4",
-    "video/mpeg",
-    "video/webm",
-    "video/ogg",
-    "video/quicktime",  # .mov
-    "video/x-msvideo",  # .avi
-}
+# Setup App
+app = FastAPI(title="SonicScribe Enterprise", version="2.0.0")
 
-app = FastAPI(title="Speech-to-Text API", version="1.0.0")
-
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,98 +29,143 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Database Initialization
+models.Base.metadata.create_all(bind=database.engine)
 
-def get_openai_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
-    return OpenAI(api_key=api_key)
+# Dependency
+def get_db():
+    db = database.SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
+# Constants
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+ALLOWED_MIME_TYPES = {
+    "audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3",
+    "audio/x-m4a", "audio/webm", "audio/mp4", "audio/ogg",
+    "audio/flac", "audio/aac", "video/mp4", "video/mpeg",
+    "video/webm", "video/ogg", "video/quicktime", "video/x-msvideo",
+}
 
-@app.get("/api/info")
-def root():
-    return {
-        "status": "ok",
-        "service": "speech-to-text",
-        "endpoints": {
-            "health": "/health",
-            "transcribe": "/api/transcribe",
-        },
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
-
-
-@app.post("/api/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
-    if file.content_type not in ALLOWED_MIME_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported file type. Use .wav, .mp3, .m4a, .webm",
-        )
-
-    data = await file.read()
-    if len(data) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File too large. Max 25MB")
+# --- Background Tasks ---
+def process_meeting_task(meeting_id: str, file_path: str):
+    """Background task to run AI pipeline."""
+    db = database.SessionLocal()
+    meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
+    
+    if not meeting:
+        db.close()
+        return
 
     try:
-        client = get_openai_client()
-        response = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=(file.filename or "audio", data, file.content_type),
-            response_format="verbose_json",
-            language="en",
-            timestamp_granularities=["word"],
-        )
-    except Exception as exc:  # pragma: no cover - passthrough
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        print(f"[{meeting_id}] Starting Transcription...")
+        # 1. Transcribe (using asyncio.run to call async function from sync context)
+        import asyncio
+        transcript_result = asyncio.run(ai_engine.transcribe_audio(file_path))
 
-    words: List[dict] = []
-    transcription_text: Optional[str] = None
+        meeting.transcription_text = transcript_result["text"]
+        meeting.transcription_json = transcript_result["words"]
+        
+        print(f"[{meeting_id}] Starting Summarization...")
+        # 2. Summarize
+        summary_result = ai_engine.summarize_meeting(meeting.transcription_text)
+        meeting.summary = summary_result.get("summary", "")
+        meeting.action_items = summary_result.get("action_items", "")
+        
+        meeting.status = "completed"
+        print(f"[{meeting_id}] Processing Complete.")
 
-    if hasattr(response, "text"):
-        transcription_text = response.text
+    except Exception as e:
+        print(f"[{meeting_id}] FAILED: {e}")
+        meeting.status = "failed"
+        meeting.summary = f"Processing failed: {str(e)}"
+    finally:
+        db.commit()
+        db.close()
 
-    if hasattr(response, "words") and response.words:
-        for w in response.words:
-            words.append(
-                {
-                    "word": w.word,
-                    "start": float(w.start),
-                    "end": float(w.end),
-                }
-            )
-    elif hasattr(response, "segments") and response.segments:
-        for seg in response.segments:
-            if getattr(seg, "words", None):
-                for w in seg.words:
-                    words.append(
-                        {
-                            "word": w.word,
-                            "start": float(w.start),
-                            "end": float(w.end),
-                        }
-                    )
+# --- API Endpoints ---
 
-    payload = {
-        "transcription": transcription_text or "",
-        "words": words,
+@app.get("/api/info")
+def info():
+    return {"status": "ok", "version": "2.0.0", "service": "SonicScribe Enterprise"}
+
+@app.post("/api/upload-hardware")
+async def upload_hardware(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Endpoint for Hardware to upload audio."""
+    # Validate
+    # (Optional: Add API Key check for hardware security)
+    
+    # Save File
+    file_ext = file.filename.split('.')[-1]
+    filename = f"{uuid.uuid4()}.{file_ext}"
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    # Create DB Entry
+    new_meeting = models.Meeting(
+        filename=file.filename,
+        file_path=file_path,  # Store the actual file path!
+        status="processing"
+    )
+    db.add(new_meeting)
+    db.commit()
+    db.refresh(new_meeting)
+    
+    # Trigger Background Task
+    background_tasks.add_task(process_meeting_task, new_meeting.id, file_path)
+    
+    return {"id": new_meeting.id, "status": "processing", "message": "Upload accepted. AI processing started."}
+
+@app.get("/api/meetings")
+def list_meetings(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    meetings = db.query(models.Meeting).order_by(models.Meeting.upload_timestamp.desc()).offset(skip).limit(limit).all()
+    return meetings
+
+@app.get("/api/meetings/{meeting_id}")
+def get_meeting(meeting_id: str, db: Session = Depends(get_db)):
+    meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    return meeting
+
+@app.get("/api/meetings/{meeting_id}/audio")
+def get_meeting_audio(meeting_id: str, db: Session = Depends(get_db)):
+    """Stream the audio file for a meeting."""
+    meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    
+    if not meeting.file_path or not os.path.exists(meeting.file_path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    
+    # Determine media type
+    ext = meeting.file_path.split('.')[-1].lower()
+    media_types = {
+        'webm': 'audio/webm',
+        'mp3': 'audio/mpeg',
+        'wav': 'audio/wav',
+        'm4a': 'audio/mp4',
+        'ogg': 'audio/ogg'
     }
-    return JSONResponse(content=payload)
+    media_type = media_types.get(ext, 'application/octet-stream')
+    
+    return FileResponse(meeting.file_path, media_type=media_type, filename=meeting.filename)
 
-
-# Serve React Frontend (must be last)
-# We check if the static directory exists to avoid errors during local dev if build is missing
-import os
+# --- Frontend Serving ---
 if os.path.exists("static"):
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 @app.exception_handler(404)
 async def custom_404_handler(_, __):
-    # For SPA routing, return index.html for unknown paths if static exists
     if os.path.exists("static/index.html"):
         return FileResponse("static/index.html")
-    return JSONResponse({"detail": "Not Founds"}, status_code=404)
+    return JSONResponse({"detail": "Not Found"}, status_code=404)

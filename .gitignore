@@ -15,3 +15,8 @@ dist/
 
 # Azure/VSCode
 .vscode/
+
+# Project Specific
+meetings.db
+uploads/
+simulate_esp32.py

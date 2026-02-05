@@ -5,7 +5,7 @@
 
 // ================= WIFI =================
 const char* ssid = "Menoone";
-const char* password = "@nurag2003";
+const char* password = "Password";
 
 // ================= CLOUD =================
 const char* CLOUD_HOST = "stt-premium-app.redbeach-eaccae08.centralindia.azurecontainerapps.io";

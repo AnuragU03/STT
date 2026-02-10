@@ -109,7 +109,7 @@ async def process_meeting(meeting_id: str, db):
             print(f"[{meeting_id}] Meeting not found in DB")
             return
 
-        file_path = meeting.filename
+        file_path = meeting.file_path
         # Ensure absolute path if needed, or rely on it being correct from main.py
         # In main.py we stored absolute path in 'filename' (or relative to valid dir)
         

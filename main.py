@@ -95,6 +95,36 @@ ALLOWED_MIME_TYPES = {
 def info():
     return {"status": "ok", "version": "2.0.0", "service": "SonicScribe Enterprise"}
 
+@app.post("/api/transcribe")
+async def transcribe_file(file: UploadFile = File(...)):
+    """
+    Manual upload endpoint for direct transcription (used by UploadPage).
+    """
+    try:
+        # Save temp file
+        file_ext = file.filename.split('.')[-1]
+        temp_filename = f"manual_{uuid.uuid4()}.{file_ext}"
+        temp_path = os.path.join(UPLOAD_DIR, temp_filename)
+        
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Run transcription immediately
+        import ai_engine
+        result = await ai_engine.transcribe_audio(temp_path)
+        
+        # Clean up temp file? Maybe keep it for debugging or history?
+        # For now, let's keep it.
+        
+        return {
+            "transcription": result["text"],
+            "words": result["words"],
+            "filename": temp_filename
+        }
+    except Exception as e:
+        print(f"Manual transcription failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/upload") # Renamed from /upload-hardware to match firmware
 async def upload_chunk(
     request: Request,

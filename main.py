@@ -146,6 +146,7 @@ async def upload_chunk(
     # 2. Determine File Path & Session
     meeting = None
     file_path = None
+    existing_session = False
     
     # Check for active session if it's a live stream
     if filename == "live.wav" and mac_address:
@@ -160,6 +161,7 @@ async def upload_chunk(
             # Append to existing
             meeting = existing_meeting
             file_path = existing_meeting.file_path
+            existing_session = True
             print(f"[{mac_address}] Appending to active session: {meeting.id}")
         else:
             # Start new session
@@ -171,7 +173,7 @@ async def upload_chunk(
                 id=str(uuid.uuid4()), 
                 filename=filename,
                 file_path=file_path,
-                file_size=0,
+                file_size=0, # Will be updated
                 status="processing",
                 mac_address=mac_address,
                 device_type="mic",
@@ -191,30 +193,58 @@ async def upload_chunk(
          file_path = os.path.join(UPLOAD_DIR, filename)
 
     # 3. Save/Append Data
-    # For new non-live files, create Meeting entry later
-    
     mode = "ab" if (meeting and os.path.exists(file_path)) else "wb"
     
     total_bytes = 0
+    chunk_count = 0
+    
+    # We open the file for writing data
     with open(file_path, mode) as f:
         async for chunk in request.stream():
+            
+            # If appending to existing session, SKIP the first 44 bytes (Header)
+            # ONLY if this is the VERY FIRST chunk of this specific request
+            if existing_session and chunk_count == 0 and len(chunk) >= 44:
+                 # Check if it looks like a RIFF header
+                 if chunk.startswith(b'RIFF'):
+                     print(f"[{mac_address}] Skipping repeated WAV header on append.")
+                     chunk = chunk[44:]
+            
             f.write(chunk)
             total_bytes += len(chunk)
+            chunk_count += 1
             
-    # PATCH WAV HEADER if it's a WAV file to ensure size is correct
-    # This is critical for live streaming playback in browsers
-    if file_path.endswith(".wav") and os.path.exists(file_path):
+            # Flush periodically to ensure data is on disk for readers
+            if chunk_count % 10 == 0:
+                f.flush()
+                
+            # Patch header periodically (every 50 chunks ~ 2-3 seconds of audio)
+            # strictly for WAV files, to allow live playback
+            if filename.endswith(".wav") and chunk_count % 50 == 0:
+                try:
+                    # We need to open a separate handle or use the existing one?
+                    # Mixing read/write on the same handle in 'ab' mode is tricky.
+                    # Safest to assume 'f' is just for appending.
+                    # We use a separate handle to patch the header.
+                    f.flush()
+                    current_size = os.path.getsize(file_path)
+                    if current_size > 44:
+                         with open(file_path, "r+b") as header_f:
+                            header_f.seek(4)
+                            header_f.write((current_size - 8).to_bytes(4, byteorder="little"))
+                            header_f.seek(40)
+                            header_f.write((current_size - 44).to_bytes(4, byteorder="little"))
+                except Exception as e:
+                    print(f"Error patching header live: {e}")
+
+    # Final patch at the end
+    if filename.endswith(".wav") and os.path.exists(file_path):
         try:
             current_size = os.path.getsize(file_path)
             if current_size > 44:
                 with open(file_path, "r+b") as f:
-                    # RIFF chunk size (File size - 8 bytes) at offset 4
                     f.seek(4)
                     f.write((current_size - 8).to_bytes(4, byteorder="little"))
-                    
-                    # Data subchunk size (File size - 44 bytes standard header) at offset 40
-                    # Note: This assumes standard 44-byte header. 
-                    # If header is larger, we might be overwriting data, but for ESP32 standard WAV it's usually 44.
                     f.seek(40)
                     f.write((current_size - 44).to_bytes(4, byteorder="little"))
         except Exception as e:

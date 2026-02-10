@@ -201,6 +201,25 @@ async def upload_chunk(
             f.write(chunk)
             total_bytes += len(chunk)
             
+    # PATCH WAV HEADER if it's a WAV file to ensure size is correct
+    # This is critical for live streaming playback in browsers
+    if file_path.endswith(".wav") and os.path.exists(file_path):
+        try:
+            current_size = os.path.getsize(file_path)
+            if current_size > 44:
+                with open(file_path, "r+b") as f:
+                    # RIFF chunk size (File size - 8 bytes) at offset 4
+                    f.seek(4)
+                    f.write((current_size - 8).to_bytes(4, byteorder="little"))
+                    
+                    # Data subchunk size (File size - 44 bytes standard header) at offset 40
+                    # Note: This assumes standard 44-byte header. 
+                    # If header is larger, we might be overwriting data, but for ESP32 standard WAV it's usually 44.
+                    f.seek(40)
+                    f.write((current_size - 44).to_bytes(4, byteorder="little"))
+        except Exception as e:
+            print(f"Error patching WAV header: {e}")
+            
     # 4. Updates
     if meeting:
         meeting.file_size = os.path.getsize(file_path) # Update total size

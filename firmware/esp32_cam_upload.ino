@@ -5,7 +5,7 @@
 
 // ================= WIFI =================
 const char* ssid = "RAGHAVENDRA 1 2G";
-const char* password = "RAGHAVENDRA1";
+const char* password = "Password";
 
 // ================= SETUP =================
 // Select your device (Uncomment ONE)

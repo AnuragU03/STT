@@ -20,3 +20,10 @@ dist/
 meetings.db
 uploads/
 simulate_esp32.py
+
+# Azure Configuration (contains secrets)
+containerapp.yaml
+.az_sql_server
+.az_storage_config
+patch.json
+

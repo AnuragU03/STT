@@ -10,7 +10,8 @@ const char* password = "Password";
 // ================= CLOUD =================
 const char* CLOUD_HOST = "stt-premium-app.redbeach-eaccae08.centralindia.azurecontainerapps.io";
 const int   CLOUD_PORT = 443; // MUST be 443 for Azure HTTPS
-const char* CLOUD_PATH = "/api/upload?filename=live.wav";
+// Added mac_address param for session tracking
+const char* CLOUD_PATH = "/api/upload?filename=live.wav&mac_address=MIC_DEVICE_01";
 
 // ================= AUDIO CONFIG =================
 #define SAMPLE_RATE 16000
@@ -166,28 +167,44 @@ void loop() {
 
   if (!streaming) return;
 
-  int32_t buffer[512];
+  // Buffer for I2S read (32-bit samples)
+  // 512 samples * 4 bytes = 2048 bytes
+  int32_t i2s_buffer[512];
   size_t bytesRead;
 
-  i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytesRead, 0);
+  // Read from I2S
+  // 3rd arg is size in bytes, so we ask for up to sizeof(i2s_buffer)
+  i2s_read(I2S_NUM_0, i2s_buffer, sizeof(i2s_buffer), &bytesRead, 0);
 
-  // Convert & stream PCM
-  for (int i = 0; i < bytesRead / 4; i++) {
-    int32_t sample = buffer[i] >> 16;
+  int samplesRead = bytesRead / 4;
+  if (samplesRead == 0) return;
+
+  // Buffer for PCM output (16-bit samples)
+  // Max 512 samples * 2 bytes = 1024 bytes
+  int16_t pcm_buffer[512];
+
+  // Convert & fill PCM buffer
+  for (int i = 0; i < samplesRead; i++) {
+    int32_t sample = i2s_buffer[i] >> 16;
     sample *= 2;    // Boost volume
 
     if (sample > 32767) sample = 32767;
     if (sample < -32768) sample = -32768;
 
-    int16_t pcm = (int16_t)sample;
-
-    // Chunk size: 2 bytes (1 sample) - Inefficient but low latency
-    // Better: buffer 512 bytes then send chunk
-    // But keeping original logic for now
-    char chunk[8];
-    sprintf(chunk, "%X\r\n", 2); 
-    streamClient.print(chunk);
-    streamClient.write((uint8_t*)&pcm, 2);
-    streamClient.print("\r\n");
+    pcm_buffer[i] = (int16_t)sample;
   }
+
+  // Calculate chunk size in bytes
+  int chunkSize = samplesRead * sizeof(int16_t);
+
+  // Send Chunk Size (HEX) + CRLF
+  char chunkHeader[16];
+  sprintf(chunkHeader, "%X\r\n", chunkSize); 
+  streamClient.print(chunkHeader);
+
+  // Send Data
+  streamClient.write((const uint8_t*)pcm_buffer, chunkSize);
+
+  // Send Chunk Terminator (CRLF)
+  streamClient.print("\r\n");
 }

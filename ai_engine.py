@@ -4,11 +4,21 @@ from openai import OpenAI
 from typing import Dict, Any
 
 # Configure Google AI
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if GOOGLE_API_KEY:
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+    except Exception as e:
+        print(f"Failed to configure Google AI: {e}")
+else:
+    print("WARNING: GOOGLE_API_KEY not set. Summarization will fail.")
 
 # Configure OpenAI
 def get_openai_client():
     api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("WARNING: OPENAI_API_KEY not set. Transcription will fail.")
+        return None
     return OpenAI(api_key=api_key)
 
 async def transcribe_audio(file_path: str) -> Dict[str, Any]:
@@ -48,7 +58,9 @@ async def transcribe_audio(file_path: str) -> Dict[str, Any]:
 def summarize_meeting(transcript_text: str) -> Dict[str, str]:
     """Generates summary and action items using Google Gemini."""
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # FIX: 'gemini-1.5-flash' requires newer library or 'google.genai'. 
+        # For 'google-generativeai' (v0.x), 'gemini-pro' is the standard text model.
+        model = genai.GenerativeModel('gemini-pro')
         
         prompt = f"""
         You are an expert AI Meeting Assistant. Analyze the following transcript and provide:

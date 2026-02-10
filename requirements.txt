@@ -5,3 +5,4 @@ openai==1.59.7
 python-dotenv==1.0.1
 sqlalchemy
 google-generativeai
+pyodbc

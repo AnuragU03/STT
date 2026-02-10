@@ -433,23 +433,22 @@ async def upload_image(
     
     active_meeting = None
     
-    # Try to find active session with matching MAC address
-    if mac_address:
-        active_meeting = db.query(models.Meeting).filter(
-            models.Meeting.mac_address == mac_address,
-            models.Meeting.session_active == True,
-            models.Meeting.status == "processing",
-            models.Meeting.device_type == "mic"
-        ).order_by(models.Meeting.upload_timestamp.desc()).first()
+    # Try to find active session (MIC)
+    # Cameras don't start sessions, Mics do. 
+    # So we look for ANY active session with device_type="mic"
+    active_meeting = db.query(models.Meeting).filter(
+        models.Meeting.session_active == True,
+        models.Meeting.status == "processing",
+        models.Meeting.device_type == "mic"
+    ).order_by(models.Meeting.upload_timestamp.desc()).first()
     
-    # Fallback: Find any active session within last 5 minutes
+    # If no active session, check recent ones (last 5 mins) as fallback
     if not active_meeting:
         five_min_ago = datetime.utcnow() - timedelta(minutes=5)
         active_meeting = db.query(models.Meeting).filter(
-            models.Meeting.session_active == True,
-            models.Meeting.status == "processing",
-            models.Meeting.device_type == "mic",
-            models.Meeting.upload_timestamp >= five_min_ago
+             models.Meeting.status == "processing",
+             models.Meeting.device_type == "mic",
+             models.Meeting.upload_timestamp >= five_min_ago
         ).order_by(models.Meeting.upload_timestamp.desc()).first()
     
     meeting_id = active_meeting.id if active_meeting else "unassigned"

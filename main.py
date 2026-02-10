@@ -425,10 +425,11 @@ async def upload_image(
     return {"status": "saved", "meeting_id": meeting_id, "file": filename}
 
 @app.post("/api/meetings/{meeting_id}/end_session")
-def end_session(meeting_id: str, db: Session = Depends(get_db)):
+def end_session(meeting_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     Manually end a recording session.
     Marks the session as inactive so new images won't be linked to it.
+    Triggers AI processing (Transcribe + Summarize).
     """
     meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
     if not meeting:
@@ -437,10 +438,17 @@ def end_session(meeting_id: str, db: Session = Depends(get_db)):
     from datetime import datetime
     meeting.session_active = False
     meeting.session_end_timestamp = datetime.utcnow()
+    # We don't set status to 'completed' here, process_meeting will do that.
+    # But strictly speaking, it might still be 'processing' or 'uploaded'.
+    
     db.commit()
     
-    print(f"[Session {meeting_id}] Manually ended")
-    return {"status": "session_ended", "id": meeting_id}
+    print(f"[Session {meeting_id}] Manually ended. Triggering processing...")
+    
+    # Trigger AI processing
+    background_tasks.add_task(run_background_process, meeting.id)
+    
+    return {"status": "session_ended", "id": meeting_id, "processing_started": True}
 
 
 @app.delete("/api/meetings/{meeting_id}")

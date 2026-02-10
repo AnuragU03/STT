@@ -82,3 +82,78 @@ def summarize_meeting(transcript_text: str) -> Dict[str, str]:
     except Exception as e:
         print(f"Summarization failed: {e}")
         return {"summary": "Summarization failed.", "action_items": "None"}
+
+async def process_meeting(meeting_id: str, db):
+    """
+    Background task to run AI pipeline (Transcribe + Summarize).
+    Moved from main.py to fix circular import/attribute errors.
+    """
+    # Import here to avoid circular imports if models/database are needed
+    # But db is passed in, so we just need models if we were querying.
+    # Actually, we need to inspect the meeting object from the DB.
+    
+    # Re-import models locally to avoid circular dependency at top level
+    import models
+    from datetime import datetime
+    import asyncio
+
+    print(f"[{meeting_id}] Background Task Started")
+    
+    try:
+        # 1. Fetch meeting
+        meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
+        if not meeting:
+            print(f"[{meeting_id}] Meeting not found in DB")
+            return
+
+        file_path = meeting.filename
+        # Ensure absolute path if needed, or rely on it being correct from main.py
+        # In main.py we stored absolute path in 'filename' (or relative to valid dir)
+        
+        print(f"[{meeting_id}] Processing file: {file_path}")
+
+        # Check if file is image (just in case)
+        ext = file_path.split('.')[-1].lower()
+        if ext in ['jpg', 'jpeg', 'png', 'gif']:
+             print(f"[{meeting_id}] File is image, skipping transcription.")
+             meeting.transcription_text = "Image Capture Uploaded."
+             meeting.transcription_json = []
+             meeting.summary = "Image processing not yet implemented."
+             meeting.action_items = "None"
+             meeting.status = "completed"
+             db.commit()
+             return
+
+        # 2. Transcribe
+        print(f"[{meeting_id}] Starting Transcription...")
+        transcript_result = await transcribe_audio(file_path)
+
+        meeting.transcription_text = transcript_result["text"]
+        meeting.transcription_json = transcript_result["words"]
+        
+        # 3. Summarize
+        print(f"[{meeting_id}] Starting Summarization...")
+        summary_result = summarize_meeting(meeting.transcription_text)
+        meeting.summary = summary_result.get("summary", "")
+        meeting.action_items = summary_result.get("action_items", "")
+        
+        # 4. Finalize
+        meeting.status = "completed"
+        meeting.session_active = False
+        meeting.session_end_timestamp = datetime.utcnow()
+        
+        db.commit()
+        print(f"[{meeting_id}] Processing Complete.")
+
+    except Exception as e:
+        print(f"[{meeting_id}] FAILED: {e}")
+        # Re-fetch meeting in case session closed/expired, though we passed 'db' session
+        # Use a fresh query if needed, but 'meeting' object should still be attached or we re-query
+        try:
+             meeting.status = "failed"
+             meeting.summary = f"Processing failed: {str(e)}"
+             db.commit()
+        except:
+            pass
+    finally:
+        db.close()

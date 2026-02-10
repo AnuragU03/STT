@@ -87,57 +87,7 @@ ALLOWED_MIME_TYPES = {
 }
 
 # --- Background Tasks ---
-def process_meeting_task(meeting_id: str, file_path: str):
-    """Background task to run AI pipeline."""
-    db = database.SessionLocal()
-    meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
-    
-    if not meeting:
-        db.close()
-        return
-
-    try:
-        print(f"[{meeting_id}] Starting Transcription...")
-        
-        # Check if file is image
-        ext = file_path.split('.')[-1].lower()
-        if ext in ['jpg', 'jpeg', 'png', 'gif']:
-             print(f"[{meeting_id}] File is image, skipping transcription.")
-             meeting.transcription_text = "Image Capture Uploaded."
-             meeting.transcription_json = []
-             meeting.summary = "Image processing not yet implemented."
-             meeting.action_items = "None"
-             meeting.status = "completed"
-             db.commit()
-             db.close()
-             return
-
-        # 1. Transcribe (using asyncio.run to call async function from sync context)
-        import asyncio
-        transcript_result = asyncio.run(ai_engine.transcribe_audio(file_path))
-
-        meeting.transcription_text = transcript_result["text"]
-        meeting.transcription_json = transcript_result["words"]
-        
-        print(f"[{meeting_id}] Starting Summarization...")
-        # 2. Summarize
-        summary_result = ai_engine.summarize_meeting(meeting.transcription_text)
-        meeting.summary = summary_result.get("summary", "")
-        meeting.action_items = summary_result.get("action_items", "")
-        
-        meeting.status = "completed"
-        meeting.session_active = False  # Mark session as inactive
-        from datetime import datetime
-        meeting.session_end_timestamp = datetime.utcnow()
-        print(f"[{meeting_id}] Processing Complete.")
-
-    except Exception as e:
-        print(f"[{meeting_id}] FAILED: {e}")
-        meeting.status = "failed"
-        meeting.summary = f"Processing failed: {str(e)}"
-    finally:
-        db.commit()
-        db.close()
+# process_meeting_task moved to ai_engine.py as process_meeting
 
 # --- API Endpoints ---
 
@@ -242,12 +192,40 @@ async def upload_chunk(
         db.commit()
         meeting = new_meeting
     
+    
     # Trigger processing only if it's NOT a live stream (or explicitly finished)
     # We will trigger background task for standard uploads, but skip for "live.wav" (append mode)
     if not (filename.startswith("live_") and mac_address):
-         background_tasks.add_task(ai_engine.process_meeting, meeting.id, db)
+         # Pass db session to background task? No, background task should create its own or we pass a specific one.
+         # Actually, FastAPI background tasks run after response, so dependency injection 'db' might be closed.
+         # Better to pass just the ID and let the task create a new session, OR use the session if it's not closed.
+         # In ai_engine.process_meeting, we accept 'db'. 
+         # But wait, 'db' from Depends(get_db) closes after request.
+         # So we should probably pass the session maker or handle it inside.
+         # For now, let's look at how process_meeting is implemented: it takes 'db'.
+         # We need to change process_meeting to create its own session if we can't rely on this one.
+         # BUT, for simplicity in this hotfix: process_meeting logic uses 'db'. 
+         # Let's adjust main.py to NOT pass the db, and let ai_engine create it? 
+         # Or better: Update ai_engine.py to create session.
+         
+         # Let's use a wrapper task here if needed, OR just pass the meeting_id and let ai_engine handle DB.
+         # Current ai_engine.process_meeting signature: async def process_meeting(meeting_id: str, db)
+         
+         # PROBLEM: The db session from 'Depends(get_db)' will be closed when the request finishes.
+         # SOLUTION: We need a wrapper that creates a new session.
+         
+         background_tasks.add_task(run_background_process, meeting.id)
 
     return {"status": "uploaded", "filename": filename, "id": meeting.id}
+
+def run_background_process(meeting_id: str):
+    """Wrapper to run async AI processing from background task with new DB session."""
+    import asyncio
+    new_db = database.SessionLocal()
+    try:
+        asyncio.run(ai_engine.process_meeting(meeting_id, new_db))
+    finally:
+        new_db.close()
     
     return {"status": "processing", "file": filename}
 

@@ -499,6 +499,36 @@ def end_session(meeting_id: str, background_tasks: BackgroundTasks, db: Session 
     
     return {"status": "session_ended", "id": meeting_id, "processing_started": True}
 
+@app.post("/api/end_session_by_mac")
+def end_session_by_mac(mac_address: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """
+    Firmware-friendly endpoint to end session by MAC address.
+    """
+    # Find the ACTIVE session for this MAC
+    meeting = db.query(models.Meeting).filter(
+        models.Meeting.mac_address == mac_address,
+        models.Meeting.session_active == True,
+        models.Meeting.status == "processing",
+        models.Meeting.device_type == "mic"
+    ).order_by(models.Meeting.upload_timestamp.desc()).first()
+    
+    if not meeting:
+        # Check if there's a recent "processing" meeting even if session_active=False?
+        # No, strict logic is better.
+        raise HTTPException(status_code=404, detail="No active session found for this MAC")
+    
+    from datetime import datetime
+    meeting.session_active = False
+    meeting.session_end_timestamp = datetime.utcnow()
+    db.commit()
+    
+    print(f"[{mac_address}] Session {meeting.id} ended by firmware. Triggering AI...")
+    
+    # Trigger AI processing
+    background_tasks.add_task(run_background_process, meeting.id)
+    
+    return {"status": "session_ended", "id": meeting.id}
+
 
 @app.delete("/api/meetings/{meeting_id}")
 def delete_meeting(meeting_id: str, db: Session = Depends(get_db)):

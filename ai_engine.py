@@ -1,16 +1,12 @@
 import os
-import google.generativeai as genai
+from google import genai
 from openai import OpenAI
 from typing import Dict, Any
 
-# Configure Google AI
+# Configure Google AI (New SDK)
+# Client is initialized per request or globally if key is constant
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if GOOGLE_API_KEY:
-    try:
-        genai.configure(api_key=GOOGLE_API_KEY)
-    except Exception as e:
-        print(f"Failed to configure Google AI: {e}")
-else:
+if not GOOGLE_API_KEY:
     print("WARNING: GOOGLE_API_KEY not set. Summarization will fail.")
 
 # Configure OpenAI
@@ -47,7 +43,7 @@ async def transcribe_audio(file_path: str) -> Dict[str, Any]:
         for seg in response.segments:
             if hasattr(seg, 'words'):
                 for w in seg.words:
-                     words.append({"word": w.word, "start": w.start, "end": w.end})
+                    words.append({"word": w.word, "start": w.start, "end": w.end})
 
     return {
         "text": text,
@@ -56,11 +52,12 @@ async def transcribe_audio(file_path: str) -> Dict[str, Any]:
     }
 
 def summarize_meeting(transcript_text: str) -> Dict[str, str]:
-    """Generates summary and action items using Google Gemini."""
+    """Generates summary and action items using Google Gemini (New SDK)."""
+    if not GOOGLE_API_KEY:
+         return {"summary": "Google API Key missing.", "action_items": "None"}
+
     try:
-        # FIX: 'gemini-1.5-flash' requires newer library or 'google.genai'. 
-        # For 'google-generativeai' (v0.x), 'gemini-pro' is the standard text model.
-        model = genai.GenerativeModel('gemini-pro')
+        client = genai.Client(api_key=GOOGLE_API_KEY)
         
         prompt = f"""
         You are an expert AI Meeting Assistant. Analyze the following transcript and provide:
@@ -68,14 +65,20 @@ def summarize_meeting(transcript_text: str) -> Dict[str, str]:
         2. A list of key **Action Items** (if any).
         
         Transcript:
-        {transcript_text[:30000]}  # Limit context window just in case
+        {transcript_text[:30000]}
         
         Return the response in JSON format with keys: "summary" and "action_items".
         """
         
-        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+        # New SDK usage: models.generate_content
+        response = client.models.generate_content(
+            model='gemini-2.0-flash', # Upgrade to 2.0 Flash or keep gemini-1.5-flash
+            contents=prompt,
+            config={
+                'response_mime_type': 'application/json'
+            }
+        )
         
-        # Parse result
         import json
         result = json.loads(response.text)
         return result

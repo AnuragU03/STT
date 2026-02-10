@@ -4,5 +4,5 @@ python-multipart==0.0.12
 openai==1.59.7
 python-dotenv==1.0.1
 sqlalchemy
-google-generativeai
+google-genai
 pyodbc

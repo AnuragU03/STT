@@ -154,9 +154,30 @@ async def process_meeting(meeting_id: str, db):
         meeting.transcription_text = transcript_result["text"]
         meeting.transcription_json = transcript_result["words"]
         
+        # COMMIT TRANSCRIPTION IMMEDIATELY
+        # This ensures we don't lose the transcript if summarization fails (e.g. quota limits)
+        db.commit()
+        
         # 3. Summarize
         print(f"[{meeting_id}] Starting Summarization...")
-        summary_result = summarize_meeting(meeting.transcription_text)
+        
+        summary_result = {"summary": "Summarization failed.", "action_items": "None"}
+        try:
+            summary_result = summarize_meeting(meeting.transcription_text)
+        except Exception as e:
+             # Retry once for Quota/Rate Limits (429)
+             str_err = str(e)
+             if "429" in str_err or "RESOURCE_EXHAUSTED" in str_err:
+                 print(f"[{meeting_id}] Quota exceeded. Retrying in 10s...")
+                 await asyncio.sleep(10)
+                 try:
+                     summary_result = summarize_meeting(meeting.transcription_text)
+                 except Exception as retry_e:
+                     print(f"[{meeting_id}] Retry failed: {retry_e}")
+                     summary_result = {"summary": "Summarization unavailable (Quota Exceeded).", "action_items": "Please try again later."}
+             else:
+                 print(f"[{meeting_id}] Summarization error: {e}")
+
         meeting.summary = summary_result.get("summary", "")
         meeting.action_items = summary_result.get("action_items", "")
         

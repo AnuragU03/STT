@@ -99,6 +99,9 @@ async def process_meeting(meeting_id: str, db):
     import models
     from datetime import datetime
     import asyncio
+    
+    # Wait a moment for file system to sync/flush from the recently closed stream
+    await asyncio.sleep(2.0)
 
     print(f"[{meeting_id}] Background Task Started")
     
@@ -111,9 +114,26 @@ async def process_meeting(meeting_id: str, db):
 
         file_path = meeting.file_path
         # Ensure absolute path if needed, or rely on it being correct from main.py
-        # In main.py we stored absolute path in 'filename' (or relative to valid dir)
         
-        print(f"[{meeting_id}] Processing file: {file_path}")
+        # CHECK FILE EXISTENCE AND SIZE
+        if not os.path.exists(file_path):
+             print(f"[{meeting_id}] ERROR: File not found at {file_path}")
+             meeting.status = "failed"
+             meeting.summary = "Audio file missing."
+             db.commit()
+             return
+
+        file_size = os.path.getsize(file_path)
+        print(f"[{meeting_id}] Processing file: {file_path} (Size: {file_size} bytes)")
+        
+        # Minimum size check (WAV header 44 bytes + ~0.1s audio ~3200 bytes)
+        # Let's be lenient, say 1KB
+        if file_size < 1024:
+             print(f"[{meeting_id}] ERROR: File too small ({file_size} bytes). Skipping AI.")
+             meeting.status = "failed"
+             meeting.summary = "Audio recording too short."
+             db.commit()
+             return
 
         # Check if file is image (just in case)
         ext = file_path.split('.')[-1].lower()

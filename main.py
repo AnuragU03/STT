@@ -306,7 +306,7 @@ def run_background_process(meeting_id: str):
     finally:
         new_db.close()
     
-    return {"status": "processing", "file": filename}
+    return {"status": "processing", "meeting_id": meeting_id}
 
 @app.get("/api/ack")
 def ack(file: str, db: Session = Depends(get_db)):

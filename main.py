@@ -302,7 +302,19 @@ def get_meeting_audio(meeting_id: str, db: Session = Depends(get_db)):
     }
     media_type = media_types.get(ext, 'application/octet-stream')
     
-    return FileResponse(meeting.file_path, media_type=media_type, filename=meeting.filename)
+    # FIX: For live/growing files, FileResponse with range requests can cause 416 errors
+    # if the browser requests a byte range that doesn't exist yet.
+    # We disable range requests for these files to force the browser to stream sequentially.
+    headers = {}
+    if "live" in meeting.filename or meeting.status == "processing":
+        headers["Accept-Ranges"] = "none"
+    
+    return FileResponse(
+        meeting.file_path, 
+        media_type=media_type, 
+        filename=meeting.filename,
+        headers=headers
+    )
 
 @app.get("/api/images/{image_filename}")
 def get_meeting_image(image_filename: str):

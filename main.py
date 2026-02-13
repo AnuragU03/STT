@@ -95,6 +95,26 @@ ALLOWED_MIME_TYPES = {
 def info():
     return {"status": "ok", "version": "2.0.0", "service": "SonicScribe Enterprise"}
 
+# --- Azure Blob Storage ---
+from azure.storage.blob import BlobServiceClient
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+CONTAINER_NAME = "stt-data"
+
+blob_service_client = None
+container_client = None
+
+if AZURE_STORAGE_CONNECTION_STRING:
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+        if not container_client.exists():
+            container_client.create_container()
+        print("Connected to Azure Blob Storage")
+    except Exception as e:
+        print(f"Failed to connect to Azure Blob Storage: {e}")
+else:
+    print("WARNING: AZURE_STORAGE_CONNECTION_STRING not set. Blob storage disabled.")
+
 @app.post("/api/transcribe")
 async def transcribe_file(file: UploadFile = File(...)):
     """
@@ -145,8 +165,8 @@ async def upload_chunk(
     
     # 2. Determine File Path & Session
     meeting = None
-    file_path = None
     existing_session = False
+    blob_name = filename # Default if not live
     
     # Check for active session if it's a live stream
     if filename == "live.wav" and mac_address:
@@ -154,114 +174,98 @@ async def upload_chunk(
         existing_meeting = db.query(models.Meeting).filter(
             models.Meeting.mac_address == mac_address,
             models.Meeting.status == "processing",
-            models.Meeting.device_type == "mic"
+            models.Meeting.device_type == "mic",
+            models.Meeting.session_active == True # Only append if active
         ).order_by(models.Meeting.upload_timestamp.desc()).first()
         
         if existing_meeting:
-            # Append to existing
+            # APPEND to existing
             meeting = existing_meeting
-            file_path = existing_meeting.file_path
+            blob_name = existing_meeting.filename # Use the stored blob name
             existing_session = True
-            print(f"[{mac_address}] Appending to active session: {meeting.id}")
+            print(f"[{mac_address}] Appending to active session: {meeting.id}, Blob: {blob_name}")
         else:
-            # Start new session
-            filename = f"live_{uuid.uuid4()}.wav"
-            file_path = os.path.join(UPLOAD_DIR, filename)
+            # START NEW SESSION
+            # Generate sequential name
+            blob_name = get_next_filename(prefix="live_stream", ext=".wav")
             
             # Create DB entry immediately
             meeting = models.Meeting(
                 id=str(uuid.uuid4()), 
-                filename=filename,
-                file_path=file_path,
-                file_size=0, # Will be updated
+                filename=blob_name,
+                file_path=blob_name, # Storing blob name as path for now
+                file_size=0,
                 status="processing",
                 mac_address=mac_address,
                 device_type="mic",
-                session_active=True  # Mark session as active
+                session_active=True
             )
             db.add(meeting)
             db.commit()
-            print(f"[{mac_address}] Started new session: {meeting.id}")
+            print(f"[{mac_address}] Started new session: {meeting.id}, Blob: {blob_name}")
             
-    elif filename == "cam_capture.jpg": # Cam generic name
-         filename = f"capture_{uuid.uuid4()}.jpg"
-         file_path = os.path.join(UPLOAD_DIR, filename)
+    elif filename == "cam_capture.jpg":
+         blob_name = f"capture_{uuid.uuid4()}.jpg"
     else:
-         # Standard unique file
-         if os.path.exists(os.path.join(UPLOAD_DIR, filename)):
-             filename = f"{uuid.uuid4()}_{filename}"
-         file_path = os.path.join(UPLOAD_DIR, filename)
+         if not filename.endswith(".wav"): 
+             filename = f"{filename}.wav" # Safety
+         blob_name = filename
 
-    # 3. Save/Append Data
-    mode = "ab" if (meeting and os.path.exists(file_path)) else "wb"
+    # 3. Save/Append to Azure Blob
+    if not container_client:
+        return JSONResponse(status_code=500, content={"error": "Azure Storage not configured"})
+
+    blob_client = container_client.get_blob_client(blob_name)
     
-    total_bytes = 0
-    chunk_count = 0
-    
-    # We open the file for writing data
-    with open(file_path, mode) as f:
+    total_chunks_len = 0
+    try:
+        # Stream chunks from request and append to blob
+        # AppendBlob is best for this
+        if not existing_session and not blob_client.exists():
+            blob_client.create_append_blob(content_settings=ContentSettings(content_type='audio/wav'))
+            # Note: WAV header logic specific to 'wb' vs 'ab' handled by skipping header bytes if appending
+        elif not blob_client.exists():
+             # Should exist if existing_session, but safety create
+             blob_client.create_append_blob(content_settings=ContentSettings(content_type='audio/wav'))
+        
+        chunk_buffer = bytearray()
         async for chunk in request.stream():
+            chunk_buffer.extend(chunk)
             
-            # If appending to existing session, SKIP the first 44 bytes (Header)
-            # ONLY if this is the VERY FIRST chunk of this specific request
-            if existing_session and chunk_count == 0 and len(chunk) >= 44:
-                 # Check if it looks like a RIFF header
-                 if chunk.startswith(b'RIFF'):
-                     print(f"[{mac_address}] Skipping repeated WAV header on append.")
-                     chunk = chunk[44:]
+        total_chunks_len = len(chunk_buffer)
+        
+        # Header Skip Logic (Resilience)
+        # If appending to existing session, skip first 44 bytes if it looks like a WAV header
+        # RIFF header starts with 'RIFF'
+        data_to_write = chunk_buffer
+        if existing_session and len(chunk_buffer) > 44:
+            if chunk_buffer.startswith(b'RIFF'):
+                print(f"[{mac_address}] Detected WAV header in append. Skipping 44 bytes.")
+                data_to_write = chunk_buffer[44:]
+        
+        if len(data_to_write) > 0:
+            blob_client.append_block(data_to_write)
             
-            f.write(chunk)
-            total_bytes += len(chunk)
-            chunk_count += 1
-            
-            # Flush periodically to ensure data is on disk for readers
-            if chunk_count % 10 == 0:
-                f.flush()
-                
-            # Patch header periodically (every 50 chunks ~ 2-3 seconds of audio)
-            # strictly for WAV files, to allow live playback
-            if filename.endswith(".wav") and chunk_count % 50 == 0:
-                try:
-                    # We need to open a separate handle or use the existing one?
-                    # Mixing read/write on the same handle in 'ab' mode is tricky.
-                    # Safest to assume 'f' is just for appending.
-                    # We use a separate handle to patch the header.
-                    f.flush()
-                    current_size = os.path.getsize(file_path)
-                    if current_size > 44:
-                         with open(file_path, "r+b") as header_f:
-                            header_f.seek(4)
-                            header_f.write((current_size - 8).to_bytes(4, byteorder="little"))
-                            header_f.seek(40)
-                            header_f.write((current_size - 44).to_bytes(4, byteorder="little"))
-                except Exception as e:
-                    print(f"Error patching header live: {e}")
+    except Exception as e:
+        print(f"[{mac_address}] Upload Chunk Failed: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-    # Final patch at the end
-    if filename.endswith(".wav") and os.path.exists(file_path):
-        try:
-            current_size = os.path.getsize(file_path)
-            if current_size > 44:
-                with open(file_path, "r+b") as f:
-                    f.seek(4)
-                    f.write((current_size - 8).to_bytes(4, byteorder="little"))
-                    f.seek(40)
-                    f.write((current_size - 44).to_bytes(4, byteorder="little"))
-        except Exception as e:
-            print(f"Error patching WAV header: {e}")
-            
-    # 4. Updates
+    # Update size in DB
     if meeting:
-        meeting.file_size = os.path.getsize(file_path) # Update total size
-        # Update timestamp to keep session "alive" logic? (optional)
+        # We assume size increases by written amount
+        meeting.file_size += len(data_to_write)
+        meeting.upload_timestamp = datetime.utcnow()
         db.commit()
     else:
         # Create DB entry for non-streaming file (or first chunk of un-mac'd stream)
-        file_size = os.path.getsize(file_path)
+        # For non-streaming, we upload the whole file at once.
+        # This path is for non-live, non-mac_address uploads.
+        # The file_path will be the blob_name.
+        file_size = total_chunks_len
         new_meeting = models.Meeting(
             id=str(uuid.uuid4()), 
             filename=filename,
-            file_path=file_path,
+            file_path=blob_name, # Use blob_name as file_path
             file_size=file_size,
             status="processing",
             mac_address=mac_address,
@@ -358,51 +362,102 @@ def get_meeting(meeting_id: str, db: Session = Depends(get_db)):
     }
 
 @app.get("/api/meetings/{meeting_id}/audio")
-def get_meeting_audio(meeting_id: str, db: Session = Depends(get_db)):
-    """Stream the audio file for a meeting."""
+def get_audio(meeting_id: str, db: Session = Depends(get_db)):
+    """Stream the audio blob, ensuring WAV header is patched for valid duration."""
     meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
-    
-    if not meeting.file_path or not os.path.exists(meeting.file_path):
-        raise HTTPException(status_code=404, detail="Audio file not found")
-    
-    # Determine media type
-    ext = meeting.file_path.split('.')[-1].lower()
-    media_types = {
-        'webm': 'audio/webm',
-        'mp3': 'audio/mpeg',
-        'wav': 'audio/wav',
-        'm4a': 'audio/mp4',
-        'ogg': 'audio/ogg',
-        'jpg': 'image/jpeg',
-        'jpeg': 'image/jpeg',
-        'png': 'image/png'
-    }
-    media_type = media_types.get(ext, 'application/octet-stream')
-    
-    # FIX: For live/growing files, FileResponse with range requests can cause 416 errors
-    # if the browser requests a byte range that doesn't exist yet.
-    # We disable range requests for these files to force the browser to stream sequentially.
-    headers = {}
-    if "live" in meeting.filename or meeting.status == "processing":
-        headers["Accept-Ranges"] = "none"
-    
-    return FileResponse(
-        meeting.file_path, 
-        media_type=media_type, 
-        filename=meeting.filename,
-        headers=headers
-    )
 
-@app.get("/api/images/{image_filename}")
-def get_meeting_image(image_filename: str):
-    """Stream the image file."""
-    file_path = os.path.join(UPLOAD_DIR, image_filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Image not found")
+    if not container_client:
+         raise HTTPException(status_code=500, detail="Azure Storage not configured")
+         
+    blob_name = meeting.filename 
+    if "/" in blob_name or "\\" in blob_name:
+        blob_name = os.path.basename(blob_name)
+
+    blob_client = container_client.get_blob_client(blob_name)
+    if not blob_client.exists():
+        if os.path.exists(meeting.file_path) and os.path.isfile(meeting.file_path):
+             from fastapi.responses import FileResponse
+             return FileResponse(meeting.file_path, media_type="audio/wav")
+        raise HTTPException(status_code=404, detail="Audio blob not found")
+
+    # STREAMING WITH HEADER PATCHING
+    # AppendBlobs have invalid WAV headers (size=0 or partial).
+    # We must patch the header in the response stream so the browser knows the true duration.
+    try:
+        props = blob_client.get_blob_properties()
+        real_size = props.size
+        
+        def iterfile():
+            # 1. Download full blob as stream
+            stream = blob_client.download_blob()
+            
+            # 2. Read first chunk (header)
+            # We need at least 44 bytes for WAV header
+            first_chunk = stream.read(44)
+            
+            if len(first_chunk) == 44 and first_chunk.startswith(b'RIFF'):
+                # Patch sizes
+                # RIFF Chunk Size (Total - 8) @ offset 4
+                riff_size = (real_size - 8).to_bytes(4, byteorder='little')
+                # Data Subchunk Size (Total - 44) @ offset 40
+                data_size = (real_size - 44).to_bytes(4, byteorder='little')
+                
+                # Reconstruct header
+                header = (
+                    first_chunk[:4] + 
+                    riff_size + 
+                    first_chunk[8:40] + 
+                    data_size
+                )
+                yield header
+            else:
+                yield first_chunk
+                
+            # 3. Yield rest of stream
+            while True:
+                chunk = stream.read(64 * 1024) # 64KB chunks
+                if not chunk:
+                    break
+                yield chunk
+
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(iterfile(), media_type="audio/wav")
+        
+    except Exception as e:
+         print(f"Stream Error: {e}")
+         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/meetings/{meeting_id}/image/{image_filename}")
+def get_image(meeting_id: str, image_filename: str):
+    """Serve image from Blob"""
+    if not container_client:
+         raise HTTPException(status_code=500, detail="Azure Storage not configured")
     
-    return FileResponse(file_path)
+    # Extract basename in case legacy path passed
+    blob_name = os.path.basename(image_filename)
+    
+    blob_client = container_client.get_blob_client(blob_name)
+    if not blob_client.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+        
+    from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+    try:
+        sas_token = generate_blob_sas(
+            account_name=blob_service_client.account_name,
+            container_name=CONTAINER_NAME,
+            blob_name=blob_name,
+            account_key=blob_service_client.credential.account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.utcnow() + timedelta(hours=1)
+        )
+        url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{CONTAINER_NAME}/{blob_name}?{sas_token}"
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url)
+    except:
+        stream = blob_client.download_blob()
+        return Response(content=stream.readall(), media_type="image/jpeg")
 
 # --- New Endpoint for ESP32 Cams ---
 @app.post("/api/upload_image")
@@ -418,14 +473,19 @@ async def upload_image(
     }
     device_type = device_map.get(mac_address.lower(), "unknown_cam")
     
-    # 2. Save File
+    # 2. Upload to Blob
     file_ext = file.filename.split('.')[-1]
-    filename = f"{device_type}_{uuid.uuid4()}.{file_ext}"
-    file_path = os.path.join(UPLOAD_DIR, filename)
+    blob_name = f"{device_type}_{uuid.uuid4()}.{file_ext}"
     
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-        
+    if not container_client:
+         return JSONResponse(status_code=500, content={"error": "Azure Storage not configured"})
+         
+    blob_client = container_client.get_blob_client(blob_name)
+    try:
+        blob_client.upload_blob(file.file, overwrite=True, content_type=file.content_type)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
     # 3. Find Active Meeting (Session Sync)
     # Link to an ACTIVE session that is currently recording
     # Priority: 1) Active session with same MAC, 2) Any active session within 5 min, 3) Unassigned
@@ -462,15 +522,15 @@ async def upload_image(
     new_image = models.MeetingImage(
         id=str(uuid.uuid4()),
         meeting_id=meeting_id,
-        filename=filename,
-        file_path=file_path,
+        filename=blob_name,
+        file_path=blob_name, # Logic now uses blob_name roughly as file path
         device_type=device_type,
         mac_address=mac_address
     )
     db.add(new_image)
     db.commit()
     
-    return {"status": "saved", "meeting_id": meeting_id, "file": filename}
+    return {"status": "saved", "meeting_id": meeting_id, "file": blob_name}
 
 @app.post("/api/meetings/{meeting_id}/end_session")
 def end_session(meeting_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):

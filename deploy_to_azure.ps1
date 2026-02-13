@@ -131,12 +131,55 @@ az containerapp create `
     --environment $ENV_NAME `
     --image "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest" `
     --ingress external `
-    --target-port 8000 `
+    --target-port 80 `
     --min-replicas 1 `
     --max-replicas 1
 # Note: using placeholder image first — we patch everything in step 2
 
 if ($LASTEXITCODE -ne 0) { Write-Error "App creation failed."; exit 1 }
+
+# Step 6b: Load Secrets from .env.secrets if available
+$secretsFile = ".env.secrets"
+if (Test-Path $secretsFile) {
+    Write-Host "   Loading secrets from $secretsFile..."
+    Get-Content $secretsFile | ForEach-Object {
+        if ($_ -match "^(.*?)=(.*)$") {
+            $key = $matches[1].Trim()
+            $value = $matches[2].Trim()
+            [System.Environment]::SetEnvironmentVariable($key, $value, [System.EnvironmentVariableTarget]::Process)
+        }
+    }
+}
+
+# Ensure required secrets allow empty values (Azure will keep existing if not provided, but we want to be explicit)
+# If Env vars are empty, we try to fetch existing secrets from the app to avoid wiping them?
+# Actually, the 'create' command might wipe them if we pass empty strings.
+# Strategy: If local env var is empty, don't include it in the secrets array? 
+# No, we need to include them for the container logic.
+# Better Strategy: Prompt once, then save to .env.secrets
+
+if ([string]::IsNullOrEmpty($env:OPENAI_API_KEY) -or [string]::IsNullOrEmpty($env:GOOGLE_API_KEY)) {
+    Write-Host "   WARNING: API Keys not found in environment or $secretsFile"
+    $response = Read-Host "   Do you want to enter them now and save to $secretsFile? (y/n)"
+    if ($response -eq 'y') {
+        $openai = Read-Host "   Enter OPENAI_API_KEY"
+        $google = Read-Host "   Enter GOOGLE_API_KEY"
+        
+        # Save to file
+        "OPENAI_API_KEY=$openai" | Out-File -FilePath $secretsFile -Encoding utf8
+        "GOOGLE_API_KEY=$google" | Out-File -FilePath $secretsFile -Append -Encoding utf8
+        
+        # Set in current session
+        $env:OPENAI_API_KEY = $openai
+        $env:GOOGLE_API_KEY = $google
+        Write-Host "   Secrets saved to $secretsFile (added to .gitignore)"
+        
+        # Ensure .gitignore has .env.secrets
+        if (-not (Select-String -Path ".gitignore" -Pattern ".env.secrets" -Quiet)) {
+            Add-Content -Path ".gitignore" -Value "`n.env.secrets"
+        }
+    }
+}
 
 # Step 7b: Single PUT with ALL values (image, secrets, registry, volumes) 
 #          so secrets always have real values and are never redacted
@@ -168,11 +211,11 @@ $payload = [ordered]@{
                 transport  = "auto"
             }
             secrets    = @(
-                [ordered]@{ name = "openai-key"; value = "$($env:OPENAI_API_KEY)" }
-                [ordered]@{ name = "google-key"; value = "$($env:GOOGLE_API_KEY)" }
+                if (-not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)) { [ordered]@{ name = "openai-key"; value = "$($env:OPENAI_API_KEY)" } }
+                if (-not [string]::IsNullOrEmpty($env:GOOGLE_API_KEY)) { [ordered]@{ name = "google-key"; value = "$($env:GOOGLE_API_KEY)" } }
                 [ordered]@{ name = "storage-key"; value = $STORAGE_KEY }
                 [ordered]@{ name = "acr-password"; value = $ACR_PASSWORD }
-                [ordered]@{ name = "sql-connection"; value = $SQL_CONNECTION_STRING }
+                if (-not [string]::IsNullOrEmpty($SQL_CONNECTION_STRING)) { [ordered]@{ name = "sql-connection"; value = $SQL_CONNECTION_STRING } }
             )
             registries = @(
                 [ordered]@{

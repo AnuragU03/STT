@@ -75,7 +75,7 @@ unsigned long lastCapture = 0;
 void loop() {
   server.handleClient();
   
-  if (millis() - lastCapture > 30000) {
+  if (millis() - lastCapture > 30000) { // Wait 30 seconds before next capture
     lastCapture = millis();
     
     camera_fb_t *fb = esp_camera_fb_get();

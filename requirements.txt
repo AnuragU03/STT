@@ -7,3 +7,4 @@ sqlalchemy
 pyodbc
 azure-storage-blob
 azure-cognitiveservices-speech
+requests

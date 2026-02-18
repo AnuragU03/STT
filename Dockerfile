@@ -6,6 +6,7 @@ COPY client/package.json client/package-lock.json* ./
 # Install dependencies
 RUN npm install
 # Copy source code
+ARG CACHEBUST=1
 COPY client/ .
 # Build the application
 RUN npm run build
@@ -20,6 +21,12 @@ ENV PYTHONUNBUFFERED=1
 # Install system dependencies (FFmpeg for Whisper, ODBC for SQL Server)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    libgstreamer1.0-0 \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    libssl-dev \
     curl \
     gnupg \
     ca-certificates \

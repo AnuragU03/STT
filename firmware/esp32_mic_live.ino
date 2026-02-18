@@ -1,51 +1,126 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
+#include <WiFiManager.h>
 #include "driver/i2s.h"
 
-// ================= WIFI =================
-const char* ssid = "Menoone";
-const char* password = "Password";
+// ===== OLED =====
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-// ================= CLOUD =================
-const char* CLOUD_HOST = "stt-premium-app.redbeach-eaccae08.centralindia.azurecontainerapps.io";
-const int   CLOUD_PORT = 443; // MUST be 443 for Azure HTTPS
-// Added mac_address param for session tracking
-const char* CLOUD_PATH = "/api/upload?filename=live.wav&mac_address=MIC_DEVICE_01";
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ================= AUDIO CONFIG =================
+// ================= PINS =================
+#define BTN_START       15
+#define BTN_STOP        14
+#define WIFI_RESET_PIN  0
+
+// ================= AUDIO =================
 #define SAMPLE_RATE 16000
-
-// ================= I2S PINS =================
 #define I2S_WS   25
 #define I2S_SD   33
 #define I2S_SCK  26
 
+// ================= CLOUD =================
+const char* CLOUD_HOST = "stt-premium-app.mangoisland-7c38ba74.centralindia.azurecontainerapps.io";
+const int   CLOUD_PORT = 443;
+const char* CLOUD_PATH =
+  "/api/upload?filename=live.wav&mac_address=MIC_DEVICE_01";
+
+// ================= CAMERAS =================
+const char* CAM1_HOST = "cam1.local";
+const char* CAM2_HOST = "cam2.local";
+
+// ================= GLOBALS =================
 WebServer server(80);
+WiFiClientSecure streamClient;
 
-// ================= STREAM STATE =================
 bool streaming = false;
-WiFiClientSecure streamClient; // Secure Client for HTTPS
+bool cam1Online = false;
+bool cam2Online = false;
 
-// ================= WAV HEADER (STREAMED AS FIRST CHUNK) =================
+bool lastStartState = HIGH;
+bool lastStopState  = HIGH;
+unsigned long bootTime;
+
+// ======================================================
+// OLED UPDATE
+// ======================================================
+void updateOLED(const char* statusText) {
+  display.clearDisplay();
+
+  // VINSHANKS title
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 0);
+  display.println("VINSHANKS");
+
+  display.drawLine(0, 20, 127, 20, SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 24);
+  display.print("Cam 1: ");
+  display.println(cam1Online ? "ONLINE" : "OFFLINE");
+
+  display.setCursor(0, 34);
+  display.print("Cam 2: ");
+  display.println(cam2Online ? "ONLINE" : "OFFLINE");
+
+  display.setCursor(0, 48);
+  display.println(statusText);
+
+  display.display();
+}
+
+// ======================================================
+// CAMERA STATUS CHECK
+// ======================================================
+bool isCamOnline(const char* host) {
+  HTTPClient http;
+  http.setTimeout(2000);
+  http.begin("http://" + String(host) + "/");
+  int code = http.GET();
+  http.end();
+  return (code > 0);
+}
+
+// ======================================================
+// SEND CAMERA COMMAND
+// ======================================================
+void sendCamCommand(const char* cmd) {
+  HTTPClient http;
+
+  Serial.println("[CAM CMD] " + String(cmd));
+
+  http.begin("http://" + String(CAM1_HOST) + "/" + cmd);
+  http.GET(); http.end();
+
+  http.begin("http://" + String(CAM2_HOST) + "/" + cmd);
+  http.GET(); http.end();
+}
+
+// ======================================================
+// WAV HEADER
+// ======================================================
 void sendWavHeader(WiFiClientSecure &client) {
   uint32_t sampleRate = SAMPLE_RATE;
   uint16_t channels = 1;
   uint16_t bits = 16;
   uint32_t byteRate = sampleRate * channels * bits / 8;
   uint16_t blockAlign = channels * bits / 8;
-  uint32_t dataSize = 0xFFFFFFFF; // Unknown length
+  uint32_t dataSize = 0xFFFFFFFF;
 
-  // Prepare header buffer (44 bytes)
   uint8_t header[44];
-  
-  // RIFF
   memcpy(header, "RIFF", 4);
   uint32_t fileSize = 36 + dataSize;
   memcpy(header + 4, &fileSize, 4);
   memcpy(header + 8, "WAVEfmt ", 8);
-  
-  // fmt chunk
+
   uint32_t subChunk1 = 16;
   uint16_t audioFmt = 1;
   memcpy(header + 16, &subChunk1, 4);
@@ -55,22 +130,19 @@ void sendWavHeader(WiFiClientSecure &client) {
   memcpy(header + 28, &byteRate, 4);
   memcpy(header + 32, &blockAlign, 2);
   memcpy(header + 34, &bits, 2);
-  
-  // data chunk
   memcpy(header + 36, "data", 4);
   memcpy(header + 40, &dataSize, 4);
 
-  // Send Chunk Size (44 bytes = 0x2C)
   client.print("2C\r\n");
-  // Send Data
   client.write(header, 44);
-  // Send Chunk Terminator
   client.print("\r\n");
 }
 
-// ================= I2S INIT =================
+// ======================================================
+// I2S INIT
+// ======================================================
 void setupI2S() {
-  i2s_config_t config = {
+  i2s_config_t cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
@@ -84,39 +156,32 @@ void setupI2S() {
 
   i2s_pin_config_t pins = {
     .bck_io_num = I2S_SCK,
-    .ws_io_num = I2S_WS,
+    .ws_io_num  = I2S_WS,
     .data_out_num = -1,
-    .data_in_num = I2S_SD
+    .data_in_num  = I2S_SD
   };
 
-  i2s_driver_install(I2S_NUM_0, &config, 0, NULL);
+  i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pins);
   i2s_zero_dma_buffer(I2S_NUM_0);
+
+  Serial.println("[I2S] Ready");
 }
 
-// ================= WEB =================
-void handleRoot() {
-  server.send(200, "text/html",
-    "<h2>ESP32 Live Audio Stream</h2>"
-    "<button onclick=\"fetch('/start')\">Start Stream</button><br><br>"
-    "<button onclick=\"fetch('/stop')\">Stop Stream</button>"
-  );
-}
+// ======================================================
+// STREAM CONTROL
+// ======================================================
+void startStreaming() {
+  Serial.println("[STREAM] START");
 
-// ================= START STREAM =================
-void handleStart() {
-  if (streaming) {
-    server.send(200, "text/plain", "Already streaming");
-    return;
-  }
+  updateOLED("MEETING STARTED");
 
-  streamClient.setInsecure(); // Skip cert validation for simplicity
+  streamClient.setInsecure();
   if (!streamClient.connect(CLOUD_HOST, CLOUD_PORT)) {
-    server.send(500, "text/plain", "Cloud connection failed");
+    Serial.println("[ERROR] Cloud connect failed");
     return;
   }
 
-  // HTTP chunked POST
   streamClient.print(
     "POST " + String(CLOUD_PATH) + " HTTP/1.1\r\n"
     "Host: " + String(CLOUD_HOST) + "\r\n"
@@ -126,85 +191,125 @@ void handleStart() {
 
   sendWavHeader(streamClient);
   streaming = true;
-
-  server.send(200, "text/plain", "Live streaming started");
+  sendCamCommand("start");
 }
 
-// ================= STOP STREAM =================
-void handleStop() {
-  if (!streaming) {
-    server.send(200, "text/plain", "Not streaming");
-    return;
-  }
+void stopStreaming() {
+  Serial.println("[STREAM] STOP");
 
-  // End chunked transfer
+  updateOLED("MEETING ENDED");
+
+  // 1. End chunked transfer
   streamClient.print("0\r\n\r\n");
   streamClient.stop();
   streaming = false;
+  
+  // 2. Stop Cameras
+  sendCamCommand("stop");
 
-  server.send(200, "text/plain", "Streaming stopped");
+  // 3. TRIGGER AI PROCESSING (Call new Cloud Endpoint)
+  Serial.println("[CLOUD] Triggering AI Processing...");
+  
+  HTTPClient http;
+  http.begin("https://" + String(CLOUD_HOST) + "/api/end_session_by_mac?mac_address=MIC_DEVICE_01");
+  http.POST(""); // Empty POST request
+  http.end();
+  
+  Serial.println("[CLOUD] AI Processing Triggered");
 }
 
-// ================= SETUP =================
+// ======================================================
+// SETUP
+// ======================================================
 void setup() {
   Serial.begin(115200);
+  delay(1000);
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) delay(500);
-  Serial.println("WiFi Connected. IP: " + WiFi.localIP().toString());
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_STOP, INPUT_PULLUP);
+  pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("[OLED] FAILED");
+  }
+
+  updateOLED("BOOTING...");
+
+  WiFiManager wm;
+
+  if (digitalRead(WIFI_RESET_PIN) == LOW) {
+    Serial.println("[WiFi] Reset requested");
+    wm.resetSettings();
+    delay(1000);
+  }
+
+  if (!wm.autoConnect("Audio-ESP32-Setup")) {
+    ESP.restart();
+  }
+
+  Serial.println("[WiFi] Connected: " + WiFi.localIP().toString());
+
+  if (MDNS.begin("audio")) {
+    Serial.println("[mDNS] audio.local ready");
+  }
 
   setupI2S();
 
-  server.on("/", handleRoot);
-  server.on("/start", handleStart);
-  server.on("/stop", handleStop);
-  server.begin();
+  Serial.println("[DISCOVERY]");
+  cam1Online = isCamOnline(CAM1_HOST);
+  cam2Online = isCamOnline(CAM2_HOST);
+
+  Serial.println(cam1Online ? "[CAM1] ONLINE" : "[CAM1] OFFLINE");
+  Serial.println(cam2Online ? "[CAM2] ONLINE" : "[CAM2] OFFLINE");
+
+  updateOLED("READY");
+
+  bootTime = millis();
+  Serial.println("[SYSTEM] READY — press D2 to start");
 }
 
-// ================= LOOP =================
+// ======================================================
+// LOOP
+// ======================================================
 void loop() {
-  server.handleClient();
+  if (millis() - bootTime < 2000) return;
+
+  bool startState = digitalRead(BTN_START);
+  bool stopState  = digitalRead(BTN_STOP);
+
+  if (lastStartState == HIGH && startState == LOW && !streaming) {
+    delay(30);
+    if (digitalRead(BTN_START) == LOW) startStreaming();
+  }
+
+  if (lastStopState == HIGH && stopState == LOW && streaming) {
+    delay(30);
+    if (digitalRead(BTN_STOP) == LOW) stopStreaming();
+  }
+
+  lastStartState = startState;
+  lastStopState  = stopState;
 
   if (!streaming) return;
 
-  // Buffer for I2S read (32-bit samples)
-  // 512 samples * 4 bytes = 2048 bytes
-  int32_t i2s_buffer[512];
+  int32_t i2sBuf[512];
+  int16_t pcmBuf[512];
   size_t bytesRead;
 
-  // Read from I2S
-  // 3rd arg is size in bytes, so we ask for up to sizeof(i2s_buffer)
-  i2s_read(I2S_NUM_0, i2s_buffer, sizeof(i2s_buffer), &bytesRead, 0);
+  i2s_read(I2S_NUM_0, i2sBuf, sizeof(i2sBuf), &bytesRead, portMAX_DELAY);
+  int samples = bytesRead / 4;
 
-  int samplesRead = bytesRead / 4;
-  if (samplesRead == 0) return;
-
-  // Buffer for PCM output (16-bit samples)
-  // Max 512 samples * 2 bytes = 1024 bytes
-  int16_t pcm_buffer[512];
-
-  // Convert & fill PCM buffer
-  for (int i = 0; i < samplesRead; i++) {
-    int32_t sample = i2s_buffer[i] >> 16;
-    sample *= 2;    // Boost volume
-
-    if (sample > 32767) sample = 32767;
-    if (sample < -32768) sample = -32768;
-
-    pcm_buffer[i] = (int16_t)sample;
+  for (int i = 0; i < samples; i++) {
+    int32_t s = i2sBuf[i] >> 16;
+    s = constrain(s * 2, -32768, 32767);
+    pcmBuf[i] = (int16_t)s;
   }
 
-  // Calculate chunk size in bytes
-  int chunkSize = samplesRead * sizeof(int16_t);
-
-  // Send Chunk Size (HEX) + CRLF
-  char chunkHeader[16];
-  sprintf(chunkHeader, "%X\r\n", chunkSize); 
-  streamClient.print(chunkHeader);
-
-  // Send Data
-  streamClient.write((const uint8_t*)pcm_buffer, chunkSize);
-
-  // Send Chunk Terminator (CRLF)
+  int size = samples * 2;
+  char hdr[16];
+  sprintf(hdr, "%X\r\n", size);
+  streamClient.print(hdr);
+  streamClient.write((uint8_t*)pcmBuf, size);
   streamClient.print("\r\n");
 }

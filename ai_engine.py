@@ -84,6 +84,95 @@ def _fix_wav_header(audio_file_path: str) -> str:
         return audio_file_path
 
 
+def _detect_and_merge_speakers(phrases: list) -> list:
+    """
+    Azure sometimes splits 1 speaker into 2+ due to pauses or tone changes.
+    This merges minority speakers (< 10% of phrases) into their closest majority speaker.
+    """
+    if not phrases or len(phrases) < 3:
+        return phrases
+
+    # Count speakers
+    raw_speakers = set(p.get("speaker") for p in phrases if p.get("speaker") is not None)
+    if len(raw_speakers) <= 1:
+        return phrases  # Nothing to merge
+
+    # Build speaker timeline (list of start times per speaker)
+    speaker_segments = {}
+    for p in phrases:
+        spk = p.get("speaker")
+        if spk is None:
+            continue
+        start = p.get("start", 0)
+        if spk not in speaker_segments:
+            speaker_segments[spk] = []
+        speaker_segments[spk].append(start)
+
+    total_phrases = sum(len(v) for v in speaker_segments.values())
+    if total_phrases == 0:
+        return phrases
+
+    # Identify minority speakers (< 10% of total speech)
+    minority_speakers = [
+        spk for spk, segs in speaker_segments.items()
+        if len(segs) / total_phrases < 0.10
+    ]
+    majority_speakers = [s for s in raw_speakers if s not in minority_speakers]
+
+    if not minority_speakers or not majority_speakers:
+        return phrases
+
+    # Merge each minority speaker into the closest majority speaker by timing
+    merge_map = {}
+    for minor in minority_speakers:
+        minor_times = speaker_segments[minor]
+        best_major = min(
+            majority_speakers,
+            key=lambda m: min(abs(t - mt) for mt in speaker_segments[m] for t in minor_times)
+        )
+        merge_map[minor] = best_major
+
+    if merge_map:
+        merged_count = sum(len(speaker_segments[m]) for m in merge_map)
+        print(f"[SpeakerMerge] Merging {len(merge_map)} minority speakers into majority: {merge_map} ({merged_count} phrases)")
+        for p in phrases:
+            if p.get("speaker") in merge_map:
+                p["speaker"] = merge_map[p["speaker"]]
+
+    return phrases
+
+
+def _remap_speaker_labels(results: list) -> list:
+    """Remap speaker IDs to clean sequential Guest-1, Guest-2, ... labels."""
+    speaker_map = {}
+    counter = 1
+    for seg in results:
+        spk = seg.get("speaker")
+        if spk and spk not in speaker_map:
+            speaker_map[spk] = f"Guest-{counter}"
+            counter += 1
+    for seg in results:
+        if seg.get("speaker") in speaker_map:
+            seg["speaker"] = speaker_map[seg["speaker"]]
+    return results
+
+
+def _get_audio_duration(audio_file_path: str) -> float:
+    """Get audio duration in seconds. Tries WAV header, falls back to file size estimate."""
+    try:
+        import wave, contextlib
+        with contextlib.closing(wave.open(audio_file_path, 'r')) as f:
+            return f.getnframes() / float(f.getframerate())
+    except Exception:
+        pass
+    # Fallback: estimate from file size (~1 min per MB for 16kHz mono 16-bit)
+    try:
+        size_mb = os.path.getsize(audio_file_path) / (1024 * 1024)
+        return size_mb * 60
+    except Exception:
+        return 300  # safe default 5 min
+
+
 def transcribe_fast_api(audio_file_path: str, locales: list[str] | None = None, max_speakers: int = 4) -> dict | None:
     """
     Azure Speech Fast Transcription REST API — processes MUCH faster than real-time.
@@ -110,10 +199,14 @@ def transcribe_fast_api(audio_file_path: str, locales: list[str] | None = None, 
     # Clamp max_speakers to reasonable range
     max_speakers = max(2, min(max_speakers, 10))
     
+    # Use wide range (1-6) for auto-detection; merge step handles over-splitting
+    diarization_max = max(max_speakers, 6)
+    
     definition = {
         "locales": locales,
-        "diarizationSettings": {"minSpeakers": 1, "maxSpeakers": max_speakers},
-        "profanityFilterMode": "None"
+        "diarizationSettings": {"minSpeakers": 1, "maxSpeakers": diarization_max},
+        "profanityFilterMode": "None",
+        "wordLevelTimestampsEnabled": True,
     }
 
     t_start = time.time()
@@ -169,10 +262,14 @@ def transcribe_fast_api(audio_file_path: str, locales: list[str] | None = None, 
 
     # Debug: log first phrase structure and check if diarization returned speaker data
     has_speaker_data = False
+    has_word_level = False
     if phrases:
         sample = {k: v for k, v in phrases[0].items() if k != 'words'}
         print(f"[FastTranscribe] Sample phrase: {sample}")
         has_speaker_data = "speaker" in phrases[0]
+        has_word_level = "words" in phrases[0] and len(phrases[0].get("words", [])) > 0
+        if has_word_level:
+            print(f"[FastTranscribe] Word-level timestamps available ({len(phrases[0]['words'])} words in first phrase)")
         if not has_speaker_data:
             print(f"[FastTranscribe] WARNING: No 'speaker' key — diarizationSettings may not have been accepted")
             # Still return the transcript (without speaker labels) rather than falling
@@ -208,6 +305,18 @@ def transcribe_fast_api(audio_file_path: str, locales: list[str] | None = None, 
             "start": round(start_s, 2),
             "end": round(start_s + dur_s, 2)
         }
+
+        # Include word-level timestamps if available (for precise transcript highlighting)
+        if has_word_level and "words" in phrase:
+            word_timings = []
+            for w in phrase["words"]:
+                wt = {"text": w.get("text", "")}
+                if "offsetMilliseconds" in w:
+                    wt["start"] = round(w["offsetMilliseconds"] / 1000.0, 3)
+                    wt["end"] = round((w["offsetMilliseconds"] + w.get("durationMilliseconds", 0)) / 1000.0, 3)
+                word_timings.append(wt)
+            segment["words"] = word_timings
+
         all_results.append(segment)
 
     # If diarization data was missing, apply improved silence-gap heuristic
@@ -241,6 +350,13 @@ def transcribe_fast_api(audio_file_path: str, locales: list[str] | None = None, 
         # Count actual speakers assigned
         unique_speakers = set(seg["speaker"] for seg in all_results)
         print(f"[FastTranscribe] Heuristic assigned {len(unique_speakers)} speakers: {unique_speakers}")
+
+    # Auto-merge over-split speakers (minority < 10% get merged into nearest majority)
+    if has_speaker_data:
+        all_results = _detect_and_merge_speakers(all_results)
+    
+    # Remap to clean sequential Guest-1, Guest-2 labels
+    all_results = _remap_speaker_labels(all_results)
 
     for seg in all_results:
         full_text.append(f"{seg['speaker']}: {seg['word']}")
@@ -431,8 +547,11 @@ def transcribe_with_azure(audio_file_path: str, locales: list[str] | None = None
     conversation_transcriber.start_transcribing_async()
     
     # Wait for completion — timeout must exceed audio duration
-    # Azure processes roughly in real-time, so timeout = 1.5x duration + 120s buffer
-    transcribe_timeout = max(600, int(audio_duration_s * 1.5) + 120)
+    # Use accurate duration calculation for proper timeout
+    if audio_duration_s <= 0:
+        audio_duration_s = _get_audio_duration(audio_file_path)
+    transcribe_timeout = int(max(audio_duration_s * 1.2, audio_duration_s + 60))
+    transcribe_timeout = min(transcribe_timeout, 1800)  # Hard cap 30 min
     print(f"Waiting for transcription (timeout={transcribe_timeout}s for ~{audio_duration_s:.0f}s audio)...")
     done_event.wait(timeout=transcribe_timeout)
     
@@ -500,7 +619,8 @@ def transcribe_with_azure(audio_file_path: str, locales: list[str] | None = None
         
         t_fb_start = time.time()
         speech_recognizer.start_continuous_recognition()
-        fb_timeout = max(600, int(audio_duration_s * 1.5) + 120)
+        fb_timeout = int(max(audio_duration_s * 1.2, audio_duration_s + 60))
+        fb_timeout = min(fb_timeout, 1800)  # Hard cap 30 min
         fb_done_event.wait(timeout=fb_timeout)
         speech_recognizer.stop_continuous_recognition()
         print(f"Fallback transcription completed in {time.time() - t_fb_start:.1f}s")

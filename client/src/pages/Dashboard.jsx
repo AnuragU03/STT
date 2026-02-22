@@ -1,15 +1,16 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { useDropzone } from 'react-dropzone';
 
 export default function Dashboard() {
     const navigate = useNavigate();
+    const [searchParams] = useSearchParams();
 
     // =================== STATE ===================
     const [meetings, setMeetings] = useState([]);
     const [loading, setLoading] = useState(true);
-    const [activeView, setActiveView] = useState('dashboard'); // 'dashboard' or 'storage'
+    const [activeView, setActiveView] = useState(searchParams.get('view') === 'storage' ? 'storage' : 'dashboard');
 
     // ESP32 Status
     const [esp32Online, setEsp32Online] = useState(false);
@@ -332,10 +333,6 @@ export default function Dashboard() {
                             <span className="text-xl">📊</span>
                             <span className="hidden lg:block">Dashboard</span>
                         </button>
-                        <Link to="/upload" className="clay-btn p-4 flex items-center gap-3 text-slate-500 hover:text-indigo-500">
-                            <span className="text-xl">🎵</span>
-                            <span className="hidden lg:block">Recordings</span>
-                        </Link>
                         <button
                             onClick={() => setActiveView('storage')}
                             className={`clay-btn p-4 flex items-center gap-3 ${activeView === 'storage' ? 'active text-indigo-600' : 'text-slate-500 hover:text-indigo-500'}`}
@@ -685,7 +682,7 @@ export default function Dashboard() {
                                             <span className="text-2xl flex-shrink-0">{getMeetingIcon(m)}</span>
 
                                             {/* Clickable content area */}
-                                            <button onClick={() => navigate(`/meetings/${m.id}`)} className="flex-1 min-w-0 text-left">
+                                            <button onClick={() => navigate(`/meetings/${m.id}?from=storage`)} className="flex-1 min-w-0 text-left">
                                                 <p className="font-bold text-sm truncate">{m.filename}</p>
                                                 <div className="flex items-center gap-3 mt-1 flex-wrap">
                                                     <span className={`text-xs font-bold ${m.status === 'completed' ? 'text-green-600' : m.status === 'processing' ? 'text-blue-600' : 'text-red-600'}`}>
@@ -702,7 +699,7 @@ export default function Dashboard() {
                                             {/* Action Buttons */}
                                             <div className="flex items-center gap-2 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
                                                 <button
-                                                    onClick={() => navigate(`/meetings/${m.id}`)}
+                                                    onClick={() => navigate(`/meetings/${m.id}?from=storage`)}
                                                     className="clay-btn w-9 h-9 rounded-lg flex items-center justify-center text-indigo-600 hover:bg-indigo-50 text-sm"
                                                     title="Open"
                                                 >👁️</button>

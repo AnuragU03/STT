@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 
 export default function MeetingDetail() {
     const { id } = useParams();
+    const [searchParams] = useSearchParams();
+    const fromStorage = searchParams.get('from') === 'storage';
     const [meeting, setMeeting] = useState(null);
     const [loading, setLoading] = useState(true);
     const [activeTab, setActiveTab] = useState('summary');
@@ -162,8 +164,8 @@ export default function MeetingDetail() {
 
                 {/* Header */}
                 <div className="mb-8">
-                    <Link to="/" className="inline-flex items-center text-slate-500 hover:text-indigo-600 mb-4 transition-colors">
-                        ← Back to Dashboard
+                    <Link to={fromStorage ? '/?view=storage' : '/'} className="inline-flex items-center text-slate-500 hover:text-indigo-600 mb-4 transition-colors">
+                        ← Back to {fromStorage ? 'Storage' : 'Dashboard'}
                     </Link>
                     <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                         <div>

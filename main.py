@@ -498,8 +498,15 @@ async def upload_chunk(
     try:
         # Read all incoming data first
         chunk_buffer = bytearray()
-        async for chunk in request.stream():
-            chunk_buffer.extend(chunk)
+        try:
+            async for chunk in request.stream():
+                chunk_buffer.extend(chunk)
+        except Exception as stream_err:
+            # ESP32 may disconnect mid-upload (WiFi glitch, timeout, etc.)
+            print(f"[{mac_address}] Client disconnected mid-stream: {type(stream_err).__name__} (got {len(chunk_buffer)} bytes before disconnect)")
+            if len(chunk_buffer) == 0:
+                return JSONResponse(content={"status": "ok", "message": "client disconnected, no data"})
+            # Continue with whatever data we received — partial audio is still useful
             
         total_chunks_len = len(chunk_buffer)
         

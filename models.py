@@ -45,3 +45,11 @@ class MeetingImage(Base):
     upload_timestamp = Column(DateTime(timezone=True), server_default=func.now())
     device_type = Column(String(20))  # 'cam1', 'cam2'
     mac_address = Column(String(50))
+
+class DeviceCommand(Base):
+    __tablename__ = "device_commands"
+
+    mac_address = Column(String(50), primary_key=True, index=True)
+    command = Column(String(20), default="idle")  # 'start', 'stop', 'idle'
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_poll = Column(DateTime(timezone=True), nullable=True)

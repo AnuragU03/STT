@@ -1,15 +1,7 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { Link } from 'react-router-dom';
-import { Upload, FileAudio, Play, Pause, Copy, Check, Download, Loader2, ArrowLeft } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
 import axios from 'axios';
-import { clsx } from 'clsx';
-import { twMerge } from 'tailwind-merge';
-
-function cn(...inputs) {
-    return twMerge(clsx(inputs));
-}
 
 export default function UploadPage() {
     const [file, setFile] = useState(null);
@@ -34,16 +26,12 @@ export default function UploadPage() {
 
     const { getRootProps, getInputProps, isDragActive } = useDropzone({
         onDrop,
-        accept: {
-            'audio/*': [],
-            'video/*': []
-        },
+        accept: { 'audio/*': [], 'video/*': [] },
         maxFiles: 1
     });
 
     const handleTranscribe = async () => {
         if (!file) return;
-
         setLoading(true);
         setError(null);
 
@@ -52,23 +40,51 @@ export default function UploadPage() {
 
         try {
             const response = await axios.post('/api/transcribe', formData, {
-                headers: {
-                    'Content-Type': 'multipart/form-data',
-                },
+                headers: { 'Content-Type': 'multipart/form-data' }
             });
-
-            setTranscription(response.data);
+            
+            const meetingId = response.data.meeting_id;
+            if (!meetingId) {
+                // Legacy sync response
+                setTranscription(response.data);
+                setLoading(false);
+                return;
+            }
+            
+            // Poll for completion
+            const pollForResult = () => {
+                const poll = setInterval(async () => {
+                    try {
+                        const pollRes = await axios.get(`/api/meetings/${meetingId}`);
+                        const meeting = pollRes.data;
+                        
+                        if (meeting.status === 'completed') {
+                            clearInterval(poll);
+                            let words = [];
+                            try { words = JSON.parse(meeting.transcription_json || '[]'); } catch(e) {}
+                            setTranscription({ transcription: meeting.transcription_text, words });
+                            setLoading(false);
+                        } else if (meeting.status === 'failed') {
+                            clearInterval(poll);
+                            setError('Transcription failed: ' + (meeting.summary || 'Unknown error'));
+                            setLoading(false);
+                        }
+                    } catch (pollErr) {
+                        console.error('Poll error:', pollErr);
+                    }
+                }, 3000);
+            };
+            pollForResult();
+            
         } catch (err) {
             console.error(err);
-            setError(err.response?.data?.detail || 'Transcription failed. Please try again.');
-        } finally {
+            setError(err.response?.data?.detail || 'Upload failed. Please try again.');
             setLoading(false);
         }
     };
 
     const handleCopy = () => {
         if (!transcription) return;
-
         let text = "";
         if (showTimestamps && transcription.words) {
             text = transcription.words.map(w => {
@@ -78,7 +94,6 @@ export default function UploadPage() {
         } else {
             text = transcription.transcription;
         }
-
         navigator.clipboard.writeText(text);
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
@@ -86,17 +101,12 @@ export default function UploadPage() {
 
     const handleExport = (withTimestamps) => {
         if (!transcription) return;
-
         let text = "";
         if (withTimestamps && transcription.words) {
-            text = transcription.words.map(w => {
-                const time = formatTime(w.start);
-                return `[${time}] ${w.word}`;
-            }).join(' ');
+            text = transcription.words.map(w => `[${formatTime(w.start)}] ${w.word}`).join(' ');
         } else {
             text = transcription.transcription;
         }
-
         const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -108,6 +118,7 @@ export default function UploadPage() {
     };
 
     const formatTime = (seconds) => {
+        if (!seconds && seconds !== 0) return '00:00';
         const mins = Math.floor(seconds / 60);
         const secs = Math.floor(seconds % 60);
         return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
@@ -121,18 +132,18 @@ export default function UploadPage() {
     };
 
     return (
-        <div className="min-h-screen p-8 flex flex-col items-center bg-slate-900 text-white">
+        <div className="min-h-screen p-8 flex flex-col items-center" style={{ backgroundColor: '#f0f4f8' }}>
             <div className="w-full max-w-4xl mb-8">
-                <Link to="/" className="inline-flex items-center text-slate-400 hover:text-white transition-colors">
-                    <ArrowLeft className="w-4 h-4 mr-2" /> Back to Dashboard
+                <Link to="/" className="inline-flex items-center text-slate-500 hover:text-indigo-600 transition-colors font-bold">
+                    ← Back to Dashboard
                 </Link>
             </div>
 
             <header className="w-full max-w-4xl mb-12 text-center">
-                <h1 className="text-5xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-500 mb-4">
-                    Manual Recorder
+                <h1 className="text-5xl font-extrabold text-slate-700 mb-4">
+                    🎙️ Manual <span className="text-indigo-500">Recorder</span>
                 </h1>
-                <p className="text-slate-400 text-lg">
+                <p className="text-slate-500 text-lg">
                     Upload a file manually for instant transcription
                 </p>
             </header>
@@ -141,26 +152,23 @@ export default function UploadPage() {
                 {/* Upload Section */}
                 <div
                     {...getRootProps()}
-                    className={cn(
-                        "glass rounded-3xl p-12 transition-all duration-300 cursor-pointer border-2 border-dashed",
-                        isDragActive ? "border-blue-500 bg-blue-500/10" : "border-slate-700 hover:border-blue-400/50",
-                        file ? "border-green-500/50" : ""
-                    )}
+                    className={`clay-card p-12 transition-all duration-300 cursor-pointer border-2 border-dashed text-center ${isDragActive ? 'border-indigo-500 bg-indigo-50' : 'border-slate-300 hover:border-indigo-400'
+                        } ${file ? 'border-green-400' : ''}`}
                 >
                     <input {...getInputProps()} />
                     <div className="flex flex-col items-center gap-4">
                         {file ? (
                             <>
-                                <FileAudio className="w-16 h-16 text-green-400" />
+                                <span className="text-5xl">🎵</span>
                                 <div className="text-center">
-                                    <p className="text-xl font-semibold text-green-400">{file.name}</p>
-                                    <p className="text-slate-400">{(file.size / 1024 / 1024).toFixed(2)} MB</p>
+                                    <p className="text-xl font-bold text-green-600">{file.name}</p>
+                                    <p className="text-slate-500">{(file.size / 1024 / 1024).toFixed(2)} MB</p>
                                 </div>
                             </>
                         ) : (
                             <>
-                                <Upload className="w-16 h-16 text-blue-400 mb-2" />
-                                <p className="text-xl font-medium text-slate-200">
+                                <span className="text-5xl">☁️</span>
+                                <p className="text-xl font-bold text-slate-700">
                                     Drag & drop your audio here
                                 </p>
                                 <p className="text-slate-400">or click to browse files</p>
@@ -170,111 +178,104 @@ export default function UploadPage() {
                 </div>
 
                 {/* Controls */}
-                <AnimatePresence>
-                    {file && (
-                        <motion.div
-                            initial={{ opacity: 0, y: 20 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            className="flex justify-center"
+                {file && (
+                    <div className="flex justify-center">
+                        <button
+                            onClick={(e) => { e.stopPropagation(); handleTranscribe(); }}
+                            disabled={loading}
+                            className={`clay-btn-primary px-8 py-3 rounded-xl font-bold text-lg flex items-center gap-2 transition-all shadow-lg ${loading ? 'opacity-50 cursor-not-allowed' : ''
+                                }`}
                         >
-                            <button
-                                onClick={(e) => { e.stopPropagation(); handleTranscribe(); }}
-                                disabled={loading}
-                                className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-xl font-semibold text-lg flex items-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-blue-500/20"
-                            >
-                                {loading ? (
-                                    <>
-                                        <Loader2 className="w-5 h-5 animate-spin" />
-                                        Transcribing...
-                                    </>
-                                ) : (
-                                    <>
-                                        <span>Start Transcription</span>
-                                        <Play className="w-5 h-5 fill-current" />
-                                    </>
-                                )}
-                            </button>
-                        </motion.div>
-                    )}
-                </AnimatePresence>
+                            {loading ? (
+                                <>
+                                    <div className="animate-spin w-5 h-5 border-2 border-white border-t-transparent rounded-full"></div>
+                                    Transcribing...
+                                </>
+                            ) : (
+                                <>
+                                    🚀 Start Transcription
+                                </>
+                            )}
+                        </button>
+                    </div>
+                )}
 
                 {/* Error */}
                 {error && (
-                    <div className="bg-red-500/10 border border-red-500/50 text-red-200 p-4 rounded-xl text-center">
-                        {error}
+                    <div className="clay-card bg-red-50 border-2 border-red-200 text-red-600 p-4 text-center font-bold">
+                        ❌ {error}
                     </div>
                 )}
 
                 {/* Results */}
                 {transcription && (
-                    <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        className="glass rounded-3xl p-8 space-y-6"
-                    >
-                        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-6">
-                            <h2 className="text-2xl font-semibold">Results</h2>
+                    <div className="clay-card p-8 space-y-6">
+                        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/50 pb-6">
+                            <h2 className="text-2xl font-bold text-slate-700">📝 Results</h2>
 
                             <div className="flex flex-wrap gap-2">
                                 <button
                                     onClick={() => setShowTimestamps(!showTimestamps)}
-                                    className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 transition"
+                                    className="clay-btn px-4 py-2 text-sm text-slate-600"
                                 >
-                                    {showTimestamps ? 'Hide Timestamps' : 'Show Timestamps'}
+                                    {showTimestamps ? '🕐 Hide Timestamps' : '🕐 Show Timestamps'}
                                 </button>
-
                                 <button
                                     onClick={() => handleExport(true)}
-                                    className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 transition flex items-center gap-2"
+                                    className="clay-btn px-4 py-2 text-sm text-slate-600 flex items-center gap-1"
                                 >
-                                    <Download className="w-4 h-4" /> Export w/ Time
+                                    📥 Export w/ Time
                                 </button>
-
                                 <button
                                     onClick={handleCopy}
-                                    className="px-4 py-2 rounded-lg bg-green-600/20 text-green-400 hover:bg-green-600/30 transition flex items-center gap-2"
+                                    className="clay-btn px-4 py-2 text-sm text-green-600 flex items-center gap-1"
                                 >
-                                    {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                                    {copied ? 'Copied!' : 'Copy Text'}
+                                    {copied ? '✅ Copied!' : '📋 Copy Text'}
                                 </button>
                             </div>
                         </div>
 
                         {/* Audio Player */}
                         {audioUrl && (
-                            <audio
-                                ref={audioRef}
-                                controls
-                                src={audioUrl}
-                                className="w-full mb-4 opacity-80 hover:opacity-100 transition"
-                            />
+                            <audio ref={audioRef} controls src={audioUrl} className="w-full" />
                         )}
 
                         {/* Text Content */}
-                        <div className="bg-slate-950/50 rounded-xl p-6 max-h-[500px] overflow-y-auto leading-relaxed text-lg">
+                        <div className="clay-card p-6 bg-white max-h-[500px] overflow-y-auto leading-relaxed text-lg scroll-hide">
                             {showTimestamps && transcription.words ? (
-                                <div className="flex flex-wrap gap-x-1 gap-y-2">
-                                    {transcription.words.map((w, i) => (
-                                        <span
-                                            key={i}
-                                            onClick={() => jumpToTime(w.start)}
-                                            className="group cursor-pointer hover:bg-blue-500/20 rounded px-1 transition relative"
-                                            title={`${formatTime(w.start)} - ${formatTime(w.end)}`}
-                                        >
-                                            <span className="text-xs text-blue-400 font-mono mr-1 select-none opacity-50 group-hover:opacity-100">
-                                                [{formatTime(w.start)}]
-                                            </span>
-                                            <span className="group-hover:text-blue-200">{w.word}</span>
-                                        </span>
-                                    ))}
+                                <div className="space-y-3">
+                                    {transcription.words.map((w, i) => {
+                                        const colors = ['bg-purple-100 text-purple-600', 'bg-blue-100 text-blue-600', 'bg-green-100 text-green-600', 'bg-orange-100 text-orange-600'];
+                                        const speakerIndex = w.speaker ? w.speaker.charCodeAt(w.speaker.length - 1) % colors.length : 0;
+
+                                        return (
+                                            <div key={i} className="flex items-start gap-3">
+                                                <div className={`w-8 h-8 rounded-full ${colors[speakerIndex]} flex items-center justify-center text-xs font-bold flex-shrink-0`}>
+                                                    {w.speaker ? w.speaker.substring(0, 2).toUpperCase() : 'S1'}
+                                                </div>
+                                                <div className="bubble-left p-3 text-sm text-slate-600">
+                                                    <span
+                                                        className="text-xs text-indigo-500 font-mono mr-2 cursor-pointer hover:underline"
+                                                        onClick={() => jumpToTime(w.start)}
+                                                    >
+                                                        [{formatTime(w.start)}]
+                                                    </span>
+                                                    {w.speaker && (
+                                                        <span className="font-bold text-slate-700 mr-1">{w.speaker}:</span>
+                                                    )}
+                                                    <span>{w.word}</span>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
                                 </div>
                             ) : (
-                                <p>{transcription.transcription}</p>
+                                <p className="text-slate-700">{transcription.transcription}</p>
                             )}
                         </div>
-                    </motion.div>
+                    </div>
                 )}
             </main>
         </div>
-    )
+    );
 }

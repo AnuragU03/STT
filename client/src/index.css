@@ -1,15 +1,125 @@
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-@layer utilities {
-    .glass {
-        @apply bg-white/10 backdrop-blur-lg border border-white/20 shadow-xl;
-    }
+:root {
+    --bg-color: #f0f4f8;
+    --clay-bg: #e6eef5;
+    --primary: #6366f1;
+    --clay-shadow-out: 9px 9px 18px #cbd4db, -9px -9px 18px #ffffff;
+    --clay-shadow-in: inset 6px 6px 12px #bcc6cd, inset -6px -6px 12px #ffffff;
 }
 
 body {
-    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-    color: #fff;
+    background-color: var(--bg-color);
+    font-family: 'Nunito', sans-serif;
+    color: #475569;
     min-height: 100vh;
+}
+
+/* Claymorphism Utilities */
+.clay-card {
+    background-color: var(--clay-bg);
+    border-radius: 2rem;
+    box-shadow: var(--clay-shadow-out);
+    border: 2px solid rgba(255, 255, 255, 0.4);
+}
+
+.clay-btn {
+    border-radius: 1.5rem;
+    background: var(--clay-bg);
+    box-shadow: 6px 6px 12px #cbd4db, -6px -6px 12px #ffffff;
+    border: none;
+    transition: all 0.2s ease;
+    cursor: pointer;
+    font-weight: 700;
+}
+
+.clay-btn:active,
+.clay-btn.active {
+    box-shadow: inset 4px 4px 8px #cbd4db, inset -4px -4px 8px #ffffff;
+    transform: translateY(2px);
+}
+
+.clay-btn-primary {
+    background-color: var(--primary);
+    color: white;
+    box-shadow: 6px 6px 12px #9fa1eb, -6px -6px 12px #ffffff;
+}
+
+.clay-btn-primary:hover {
+    opacity: 0.9;
+}
+
+.clay-btn-primary:active {
+    background-color: var(--primary);
+    box-shadow: inset 4px 4px 8px #4338ca, inset -4px -4px 8px #818cf8;
+}
+
+.clay-input {
+    background: #e6eef5;
+    box-shadow: inset 5px 5px 10px #cbd4db, inset -5px -5px 10px #ffffff;
+    border-radius: 1rem;
+    border: none;
+    padding: 1rem;
+    outline: none;
+    width: 100%;
+}
+
+.scroll-hide::-webkit-scrollbar {
+    display: none;
+}
+
+.scroll-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
+
+/* Animation for Live Indicator */
+@keyframes pulse-red {
+    0% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+    }
+
+    70% {
+        transform: scale(1);
+        box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
+    }
+
+    100% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+    }
+}
+
+.recording-dot {
+    animation: pulse-red 2s infinite;
+}
+
+/* Chat bubbles */
+.bubble-left {
+    border-radius: 1.5rem 1.5rem 1.5rem 0.2rem;
+    background: white;
+    box-shadow: 4px 4px 8px #dae2e9, -4px -4px 8px #ffffff;
+}
+
+.bubble-right {
+    border-radius: 1.5rem 1.5rem 0.2rem 1.5rem;
+    background: #e0e7ff;
+    box-shadow: 4px 4px 8px #c7d2fe, -4px -4px 8px #ffffff;
+}
+
+.timestamp-active {
+    color: var(--primary);
+    font-weight: bold;
+    text-decoration: underline;
+}
+
+@layer utilities {
+    .glass {
+        @apply bg-white/40 backdrop-blur-lg border border-white/30 shadow-xl;
+    }
 }

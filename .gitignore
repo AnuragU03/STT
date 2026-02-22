@@ -27,3 +27,5 @@ containerapp.yaml
 .az_storage_config
 patch.json
 
+
+.env.secrets

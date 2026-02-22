@@ -14,13 +14,47 @@ export default function MeetingDetail() {
 
     useEffect(() => {
         fetchMeeting();
-        const interval = setInterval(() => {
-            if (meeting && meeting.status === 'processing') {
-                fetchMeeting();
-            }
-        }, 5000);
-        return () => clearInterval(interval);
-    }, [id, meeting?.status]);
+
+        // WebSocket for real-time updates (replaces polling)
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        let ws = new WebSocket(wsUrl);
+        let reconnectTimer = null;
+
+        const connectWs = () => {
+            ws = new WebSocket(wsUrl);
+
+            ws.onmessage = (evt) => {
+                try {
+                    const msg = JSON.parse(evt.data);
+                    if (msg.event === 'meeting_updated' && msg.meeting_id === id) {
+                        fetchMeeting();
+                        if (msg.status !== 'processing') {
+                            setReprocessing(false);
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+            };
+
+            ws.onclose = () => {
+                reconnectTimer = setTimeout(connectWs, 3000);
+            };
+            ws.onerror = () => ws.close();
+        };
+
+        connectWs();
+
+        // Keep-alive ping every 30s
+        const pingInterval = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping');
+        }, 30000);
+
+        return () => {
+            clearInterval(pingInterval);
+            clearTimeout(reconnectTimer);
+            if (ws) ws.close();
+        };
+    }, [id]);
 
     const fetchMeeting = async () => {
         try {
@@ -67,15 +101,7 @@ export default function MeetingDetail() {
         setReprocessing(true);
         try {
             await axios.post(`/api/meetings/${id}/reprocess?max_speakers=${maxSpeakers}&locales=${encodeURIComponent(locales)}`);
-            // Start polling for completion
-            const poll = setInterval(async () => {
-                const res = await axios.get(`/api/meetings/${id}`);
-                setMeeting(res.data);
-                if (res.data.status !== 'processing') {
-                    clearInterval(poll);
-                    setReprocessing(false);
-                }
-            }, 3000);
+            // WebSocket will notify when processing is done — no polling needed
         } catch (err) {
             console.error('Reprocess failed:', err);
             setReprocessing(false);

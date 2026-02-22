@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, BackgroundTasks, Request, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, BackgroundTasks, Request, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +16,7 @@ import models
 import database
 import ai_engine
 from pydantic import BaseModel
+import asyncio
 
 # Load env
 load_dotenv(".env.secrets")
@@ -46,6 +47,63 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =================== WebSocket Manager ===================
+class ConnectionManager:
+    """Manages WebSocket connections for real-time push notifications."""
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        print(f"[WS] Client connected ({len(self.active_connections)} total)")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        print(f"[WS] Client disconnected ({len(self.active_connections)} total)")
+
+    async def broadcast(self, message: dict):
+        """Send a JSON message to all connected clients."""
+        dead = []
+        for conn in self.active_connections:
+            try:
+                await conn.send_json(message)
+            except Exception:
+                dead.append(conn)
+        for conn in dead:
+            self.disconnect(conn)
+
+ws_manager = ConnectionManager()
+
+def notify_clients(event: str, data: dict | None = None):
+    """Fire-and-forget notification to all WebSocket clients (safe to call from sync code)."""
+    msg = {"event": event, **(data or {})}
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(ws_manager.broadcast(msg))
+        else:
+            loop.run_until_complete(ws_manager.broadcast(msg))
+    except RuntimeError:
+        # No event loop available (background thread) — create one
+        try:
+            asyncio.run(ws_manager.broadcast(msg))
+        except Exception:
+            pass  # Best effort — don't crash the pipeline
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive; client can send pings
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_json({"event": "pong"})
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
 
 # Database Initialization
 models.Base.metadata.create_all(bind=database.engine)
@@ -629,6 +687,9 @@ async def upload_chunk(
     if not is_live_stream:
          background_tasks.add_task(run_background_process, meeting.id)
 
+    # Notify WebSocket clients about the new meeting
+    notify_clients("meeting_created", {"meeting_id": meeting.id, "filename": filename})
+
     return {"status": "uploaded", "filename": filename, "id": meeting.id}
 
 def run_background_process(meeting_id: str, locales: list[str] | None = None, max_speakers: int = 4):
@@ -637,6 +698,11 @@ def run_background_process(meeting_id: str, locales: list[str] | None = None, ma
     new_db = database.SessionLocal()
     try:
         asyncio.run(ai_engine.process_meeting(meeting_id, new_db, locales=locales, max_speakers=max_speakers))
+        # Notify WebSocket clients that processing is complete
+        notify_clients("meeting_updated", {"meeting_id": meeting_id, "status": "completed"})
+    except Exception as e:
+        print(f"[BackgroundProcess] Error processing {meeting_id}: {e}")
+        notify_clients("meeting_updated", {"meeting_id": meeting_id, "status": "failed"})
     finally:
         new_db.close()
     
@@ -1139,6 +1205,10 @@ def delete_meeting(meeting_id: str, db: Session = Depends(get_db)):
     # Delete Meeting Record
     db.delete(meeting)
     db.commit()
+
+    # Notify WebSocket clients about deletion
+    notify_clients("meeting_deleted", {"meeting_id": meeting_id})
+
     return {"status": "deleted", "id": meeting_id}
 
 class RenameRequest(BaseModel):

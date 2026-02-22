@@ -48,13 +48,58 @@ export default function Dashboard() {
     const [storageFilter, setStorageFilter] = useState('all'); // 'all', 'live', 'uploads', 'images'
     const [deletingId, setDeletingId] = useState(null);
 
+    // WebSocket
+    const wsRef = useRef(null);
+
     // =================== EFFECTS ===================
     useEffect(() => {
         fetchMeetings();
         checkEsp32Status();
         const statusInterval = setInterval(checkEsp32Status, 5000);
+
+        // WebSocket connection for real-time updates
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        let ws = null;
+        let reconnectTimer = null;
+
+        const connectWs = () => {
+            ws = new WebSocket(wsUrl);
+            wsRef.current = ws;
+
+            ws.onopen = () => console.log('[WS] Connected');
+
+            ws.onmessage = (evt) => {
+                try {
+                    const msg = JSON.parse(evt.data);
+                    if (msg.event === 'meeting_created' || msg.event === 'meeting_updated' || msg.event === 'meeting_deleted') {
+                        fetchMeetings();
+                    }
+                } catch (e) { /* ignore non-JSON */ }
+            };
+
+            ws.onclose = () => {
+                console.log('[WS] Disconnected, reconnecting in 3s...');
+                reconnectTimer = setTimeout(connectWs, 3000);
+            };
+
+            ws.onerror = () => ws.close();
+        };
+
+        connectWs();
+
+        // Keep-alive ping every 30s
+        const pingInterval = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('ping');
+            }
+        }, 30000);
+
         return () => {
             clearInterval(statusInterval);
+            clearInterval(pingInterval);
+            clearTimeout(reconnectTimer);
+            if (ws) ws.close();
             if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
         };
     }, []);

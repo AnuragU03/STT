@@ -8,3 +8,6 @@ pyodbc
 azure-storage-blob
 azure-cognitiveservices-speech
 requests
+azure-ai-textanalytics>=5.3.0
+azure-core>=1.30.0
+azure-monitor-opentelemetry>=1.6.0

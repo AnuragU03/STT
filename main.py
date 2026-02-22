@@ -18,10 +18,25 @@ import ai_engine
 from pydantic import BaseModel
 
 # Load env
-load_dotenv()
+load_dotenv(".env.secrets")
 
 # Setup App
 app = FastAPI(title="SonicScribe Enterprise", version="2.0.0")
+
+# --- Application Insights Telemetry ---
+# Set APPINSIGHTS_CONNECTION_STRING or APPINSIGHTS_INSTRUMENTATION_KEY env var to enable.
+APPINSIGHTS_CONN_STR = os.getenv("APPINSIGHTS_CONNECTION_STRING") or os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
+if APPINSIGHTS_CONN_STR:
+    try:
+        from azure.monitor.opentelemetry import configure_azure_monitor
+        configure_azure_monitor(connection_string=APPINSIGHTS_CONN_STR)
+        print("📊 Application Insights telemetry enabled (azure-monitor-opentelemetry)")
+    except ImportError:
+        print("⚠️  APPINSIGHTS_CONNECTION_STRING set but azure-monitor-opentelemetry not installed. Skipping telemetry.")
+    except Exception as e:
+        print(f"⚠️  Application Insights setup failed: {e}")
+else:
+    print("⏭️  Application Insights not configured (set APPINSIGHTS_CONNECTION_STRING to enable)")
 
 # CORS
 app.add_middleware(
@@ -404,8 +419,11 @@ async def upload_chunk(
     db: Session = Depends(get_db)
 ):
     """
-    Receives raw audio chunks from ESP32.
-    Supports both full-body WAV uploads (SD/RAM) and Chunked Streaming (Live).
+    Receives audio data from ESP32.
+    Supports:
+      - Raw PCM streaming (live.pcm) — ESP32 sends raw 16-bit 16kHz mono PCM, cloud creates WAV
+      - Full WAV uploads (SD/RAM)
+      - Legacy live.wav streaming (backward compat)
     """
     
     # 1. Get Filename & MAC
@@ -415,13 +433,21 @@ async def upload_chunk(
     if not filename:
         filename = f"unknown_{uuid.uuid4()}.wav"
     
+    # Detect raw PCM mode (new firmware sends live.pcm instead of live.wav)
+    is_raw_pcm = filename.endswith(".pcm") or request.headers.get("content-type") == "application/octet-stream"
+    
     # 2. Determine File Path & Session
     meeting = None
     existing_session = False
     blob_name = filename # Default if not live
     
-    # Check for active session if it's a live stream
-    if filename == "live.wav" and mac_address:
+    # Check for active session if it's a live stream (supports both live.wav and live.pcm)
+    is_live_stream = (filename in ("live.wav", "live.pcm")) and mac_address
+    
+    if is_live_stream:
+        # Determine blob extension based on mode
+        blob_ext = ".pcm" if is_raw_pcm else ".wav"
+        
         # Find existing processing meeting for this mic
         existing_meeting = db.query(models.Meeting).filter(
             models.Meeting.mac_address == mac_address,
@@ -438,14 +464,13 @@ async def upload_chunk(
             print(f"[{mac_address}] Appending to active session: {meeting.id}, Blob: {blob_name}")
         else:
             # START NEW SESSION
-            # Generate sequential name
-            blob_name = f"live_stream_{uuid.uuid4()}.wav"
+            blob_name = f"live_stream_{uuid.uuid4()}{blob_ext}"
             
             # Create DB entry immediately
             meeting = models.Meeting(
                 id=str(uuid.uuid4()), 
                 filename=blob_name,
-                file_path=blob_name, # Storing blob name as path for now
+                file_path=blob_name,
                 file_size=0,
                 status="processing",
                 mac_address=mac_address,
@@ -454,12 +479,12 @@ async def upload_chunk(
             )
             db.add(meeting)
             db.commit()
-            print(f"[{mac_address}] Started new session: {meeting.id}, Blob: {blob_name}")
+            print(f"[{mac_address}] Started new session (raw_pcm={is_raw_pcm}): {meeting.id}, Blob: {blob_name}")
             
     elif filename == "cam_capture.jpg":
          blob_name = f"capture_{uuid.uuid4()}.jpg"
     else:
-         if not filename.endswith(".wav"): 
+         if not filename.endswith((".wav", ".pcm", ".m4a")): 
              filename = f"{filename}.wav" # Safety
          blob_name = filename
 
@@ -484,85 +509,81 @@ async def upload_chunk(
         
         # Log first bytes for debugging
         header_hex = chunk_buffer[:16].hex() if len(chunk_buffer) >= 16 else chunk_buffer.hex()
-        print(f"[{mac_address}] Received {total_chunks_len} bytes, first 16: {header_hex}")
+        print(f"[{mac_address}] Received {total_chunks_len} bytes (raw_pcm={is_raw_pcm}), first 16: {header_hex}")
         
-        # === STRIP HTTP CHUNKED TE FRAMING (if proxy leaked it through) ===
-        # ESP32 sends manual chunked encoding: "2C\r\n<44 bytes>\r\n" then "%X\r\n<data>\r\n"
-        # If the proxy doesn't decode chunked TE, raw framing bytes arrive here.
-        # Detect by checking if data starts with hex digits + \r\n (chunked size line)
-        import re
-        if not chunk_buffer.startswith(b'RIFF') and len(chunk_buffer) > 4:
-            # Check if it looks like chunked TE framing: hex number followed by \r\n
-            first_line_end = chunk_buffer.find(b'\r\n')
-            if first_line_end > 0 and first_line_end <= 8:
-                try:
-                    size_str = chunk_buffer[:first_line_end].decode('ascii').strip()
-                    chunk_size = int(size_str, 16)
-                    # Looks like chunked framing! Decode all chunks
-                    print(f"[{mac_address}] Detected chunked TE framing in body — decoding")
-                    decoded = bytearray()
-                    pos = 0
-                    while pos < len(chunk_buffer):
-                        # Find chunk size line
-                        end = chunk_buffer.find(b'\r\n', pos)
-                        if end < 0:
-                            # No more framing, append remaining
-                            decoded.extend(chunk_buffer[pos:])
-                            break
-                        try:
-                            csz = int(chunk_buffer[pos:end].decode('ascii').strip(), 16)
-                        except (ValueError, UnicodeDecodeError):
-                            # Not chunked framing anymore, append rest
-                            decoded.extend(chunk_buffer[pos:])
-                            break
-                        if csz == 0:
-                            break  # End of chunked stream
-                        data_start = end + 2
-                        data_end = data_start + csz
-                        if data_end > len(chunk_buffer):
-                            decoded.extend(chunk_buffer[data_start:])
-                            break
-                        decoded.extend(chunk_buffer[data_start:data_end])
-                        pos = data_end + 2  # Skip trailing \r\n
-                    chunk_buffer = decoded
-                    total_chunks_len = len(chunk_buffer)
-                    header_hex2 = chunk_buffer[:16].hex() if len(chunk_buffer) >= 16 else chunk_buffer.hex()
-                    print(f"[{mac_address}] After dechunk: {total_chunks_len} bytes, first 16: {header_hex2}")
-                except (ValueError, UnicodeDecodeError):
-                    pass  # Not chunked framing, continue as-is
-        
-        # Header Skip Logic — if appending to existing session, skip WAV header
+        # === DATA PROCESSING ===
         data_to_write = chunk_buffer
-        if existing_session and len(chunk_buffer) > 44:
-            if chunk_buffer.startswith(b'RIFF'):
-                print(f"[{mac_address}] Detected WAV header in append. Skipping 44 bytes.")
-                data_to_write = chunk_buffer[44:]
+        
+        if is_raw_pcm:
+            # RAW PCM MODE: Data is pure 16-bit 16kHz mono PCM samples.
+            # No headers, no chunked framing to strip. Just raw audio bytes.
+            # Cloud will create proper WAV header when session ends.
+            print(f"[{mac_address}] Raw PCM mode — {total_chunks_len} bytes of pure audio data")
+        else:
+            # LEGACY WAV MODE: May have chunked TE framing or WAV headers to strip
+            import re
+            if not chunk_buffer.startswith(b'RIFF') and len(chunk_buffer) > 4:
+                first_line_end = chunk_buffer.find(b'\r\n')
+                if first_line_end > 0 and first_line_end <= 8:
+                    try:
+                        size_str = chunk_buffer[:first_line_end].decode('ascii').strip()
+                        chunk_size = int(size_str, 16)
+                        print(f"[{mac_address}] Detected chunked TE framing — decoding")
+                        decoded = bytearray()
+                        pos = 0
+                        while pos < len(chunk_buffer):
+                            end = chunk_buffer.find(b'\r\n', pos)
+                            if end < 0:
+                                decoded.extend(chunk_buffer[pos:])
+                                break
+                            try:
+                                csz = int(chunk_buffer[pos:end].decode('ascii').strip(), 16)
+                            except (ValueError, UnicodeDecodeError):
+                                decoded.extend(chunk_buffer[pos:])
+                                break
+                            if csz == 0:
+                                break
+                            data_start = end + 2
+                            data_end = data_start + csz
+                            if data_end > len(chunk_buffer):
+                                decoded.extend(chunk_buffer[data_start:])
+                                break
+                            decoded.extend(chunk_buffer[data_start:data_end])
+                            pos = data_end + 2
+                        chunk_buffer = decoded
+                        total_chunks_len = len(chunk_buffer)
+                    except (ValueError, UnicodeDecodeError):
+                        pass
+            
+            # Strip WAV header on append
+            data_to_write = chunk_buffer
+            if existing_session and len(chunk_buffer) > 44:
+                if chunk_buffer.startswith(b'RIFF'):
+                    print(f"[{mac_address}] Stripping WAV header on append (44 bytes)")
+                    data_to_write = chunk_buffer[44:]
         
         if len(data_to_write) == 0:
-            return JSONResponse(content={"status": "ok", "message": "no data after header skip"})
+            return JSONResponse(content={"status": "ok", "message": "no data after processing"})
 
         # Create or append to blob
+        content_type = 'application/octet-stream' if is_raw_pcm else 'audio/wav'
         try:
-            # Try append blob first (for streaming)
             if not existing_session:
-                blob_client.create_append_blob(content_settings=ContentSettings(content_type='audio/wav'))
+                blob_client.create_append_blob(content_settings=ContentSettings(content_type=content_type))
             blob_client.append_block(data_to_write)
         except Exception as append_err:
-            # Fallback: upload as block blob (works for any blob type)
             print(f"[{mac_address}] Append failed ({append_err}), using block blob upload")
             if existing_session:
-                # Download existing + append new data
                 try:
                     existing_data = blob_client.download_blob().readall()
                     blob_client.upload_blob(existing_data + bytes(data_to_write), overwrite=True,
-                                          content_settings=ContentSettings(content_type='audio/wav'))
+                                          content_settings=ContentSettings(content_type=content_type))
                 except Exception:
-                    # Blob doesn't exist yet, just upload
                     blob_client.upload_blob(bytes(data_to_write), overwrite=True,
-                                          content_settings=ContentSettings(content_type='audio/wav'))
+                                          content_settings=ContentSettings(content_type=content_type))
             else:
                 blob_client.upload_blob(bytes(data_to_write), overwrite=True,
-                                      content_settings=ContentSettings(content_type='audio/wav'))
+                                      content_settings=ContentSettings(content_type=content_type))
             
     except Exception as e:
         import traceback
@@ -597,36 +618,18 @@ async def upload_chunk(
     
     
     # Trigger processing only if it's NOT a live stream (or explicitly finished)
-    # We will trigger background task for standard uploads, but skip for "live.wav" (append mode)
-    if not (filename.startswith("live_") and mac_address):
-         # Pass db session to background task? No, background task should create its own or we pass a specific one.
-         # Actually, FastAPI background tasks run after response, so dependency injection 'db' might be closed.
-         # Better to pass just the ID and let the task create a new session, OR use the session if it's not closed.
-         # In ai_engine.process_meeting, we accept 'db'. 
-         # But wait, 'db' from Depends(get_db) closes after request.
-         # So we should probably pass the session maker or handle it inside.
-         # For now, let's look at how process_meeting is implemented: it takes 'db'.
-         # We need to change process_meeting to create its own session if we can't rely on this one.
-         # BUT, for simplicity in this hotfix: process_meeting logic uses 'db'. 
-         # Let's adjust main.py to NOT pass the db, and let ai_engine create it? 
-         # Or better: Update ai_engine.py to create session.
-         
-         # Let's use a wrapper task here if needed, OR just pass the meeting_id and let ai_engine handle DB.
-         # Current ai_engine.process_meeting signature: async def process_meeting(meeting_id: str, db)
-         
-         # PROBLEM: The db session from 'Depends(get_db)' will be closed when the request finishes.
-         # SOLUTION: We need a wrapper that creates a new session.
-         
+    # Live streams are processed when end_session_by_mac is called
+    if not is_live_stream:
          background_tasks.add_task(run_background_process, meeting.id)
 
     return {"status": "uploaded", "filename": filename, "id": meeting.id}
 
-def run_background_process(meeting_id: str):
+def run_background_process(meeting_id: str, locales: list[str] | None = None, max_speakers: int = 4):
     """Wrapper to run async AI processing from background task with new DB session."""
     import asyncio
     new_db = database.SessionLocal()
     try:
-        asyncio.run(ai_engine.process_meeting(meeting_id, new_db))
+        asyncio.run(ai_engine.process_meeting(meeting_id, new_db, locales=locales, max_speakers=max_speakers))
     finally:
         new_db.close()
     
@@ -722,18 +725,24 @@ def get_audio(meeting_id: str, request: Request, db: Session = Depends(get_db)):
         
         # Patch WAV header if needed (fix streaming WAV from ESP32)
         if blob_data[:4] == b'RIFF' and len(blob_data) >= 44:
-            riff_size = int.from_bytes(blob_data[4:8], 'little')
-            data_size = int.from_bytes(blob_data[40:44], 'little')
+            # Fix RIFF size (always at offset 4)
             correct_riff = len(blob_data) - 8
-            correct_data = len(blob_data) - 44
-            if riff_size != correct_riff or data_size != correct_data:
-                blob_data = (
-                    blob_data[:4] +
-                    correct_riff.to_bytes(4, 'little') +
-                    blob_data[8:40] +
-                    correct_data.to_bytes(4, 'little') +
-                    blob_data[44:]
-                )
+            riff_size = int.from_bytes(blob_data[4:8], 'little')
+            if riff_size != correct_riff:
+                blob_data = blob_data[:4] + correct_riff.to_bytes(4, 'little') + blob_data[8:]
+            # Scan for "data" sub-chunk and fix its size
+            pos = 12  # skip RIFF header + "WAVE"
+            while pos + 8 <= len(blob_data):
+                chunk_id = blob_data[pos:pos+4]
+                chunk_sz = int.from_bytes(blob_data[pos+4:pos+8], 'little')
+                if chunk_id == b'data':
+                    correct_data = len(blob_data) - (pos + 8)
+                    if chunk_sz != correct_data:
+                        blob_data = blob_data[:pos+4] + correct_data.to_bytes(4, 'little') + blob_data[pos+8:]
+                    break
+                pos += 8 + chunk_sz
+                if chunk_sz % 2 == 1:
+                    pos += 1  # WAV chunks are word-aligned
         
         total_size = len(blob_data)
         
@@ -934,23 +943,35 @@ async def upload_image(
     return {"status": "saved", "meeting_id": meeting_id, "file": blob_name}
 
 @app.post("/api/meetings/{meeting_id}/reprocess")
-def reprocess_meeting(meeting_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """Manually re-trigger AI processing for a meeting stuck in processing or failed status."""
+def reprocess_meeting(
+    meeting_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    locales: str | None = None,
+    max_speakers: int = 4
+):
+    """
+    Manually re-trigger AI processing for a meeting.
+    Query params:
+        locales: Comma-separated language codes (e.g. 'en-US,hi-IN'). Default: en-US,hi-IN
+        max_speakers: Max expected speakers (2-10). Default: 4
+    """
     meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
     
-    if meeting.status == "completed":
-        raise HTTPException(status_code=400, detail="Meeting already completed")
-    
+    # Allow reprocessing completed meetings too (for re-transcription with different params)
     meeting.status = "processing"
     meeting.session_active = False
     db.commit()
     
-    print(f"[{meeting_id}] Manual reprocess triggered")
-    background_tasks.add_task(run_background_process, meeting.id)
+    # Parse locales from comma-separated string
+    locale_list = [l.strip() for l in locales.split(',')] if locales else None
     
-    return {"status": "reprocessing", "id": meeting_id}
+    print(f"[{meeting_id}] Manual reprocess triggered (locales={locale_list}, max_speakers={max_speakers})")
+    background_tasks.add_task(run_background_process, meeting.id, locales=locale_list, max_speakers=max_speakers)
+    
+    return {"status": "reprocessing", "id": meeting_id, "locales": locale_list or ["en-US", "hi-IN"], "max_speakers": max_speakers}
 
 @app.post("/api/meetings/{meeting_id}/end_session")
 def end_session(meeting_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
@@ -992,8 +1013,6 @@ def end_session_by_mac(mac_address: str, background_tasks: BackgroundTasks, db: 
     ).order_by(models.Meeting.upload_timestamp.desc()).first()
     
     if not meeting:
-        # Check if there's a recent "processing" meeting even if session_active=False?
-        # No, strict logic is better.
         raise HTTPException(status_code=404, detail="No active session found for this MAC")
     
     from datetime import datetime
@@ -1001,7 +1020,60 @@ def end_session_by_mac(mac_address: str, background_tasks: BackgroundTasks, db: 
     meeting.session_end_timestamp = datetime.utcnow()
     db.commit()
     
-    print(f"[{mac_address}] Session {meeting.id} ended by firmware. Triggering AI...")
+    print(f"[{mac_address}] Session {meeting.id} ended by firmware. Blob: {meeting.filename}")
+    
+    # === If raw PCM blob, convert to proper WAV in-place ===
+    if meeting.filename and meeting.filename.endswith(".pcm") and container_client:
+        try:
+            pcm_blob = container_client.get_blob_client(meeting.filename)
+            pcm_data = pcm_blob.download_blob().readall()
+            pcm_size = len(pcm_data)
+            print(f"[{mac_address}] Converting raw PCM to WAV: {pcm_size} bytes of PCM data")
+            
+            # Build correct WAV header for 16kHz 16-bit mono PCM
+            import struct
+            sample_rate = 16000
+            channels = 1
+            bits_per_sample = 16
+            byte_rate = sample_rate * channels * (bits_per_sample // 8)
+            block_align = channels * (bits_per_sample // 8)
+            data_size = pcm_size
+            file_size = 36 + data_size  # RIFF size = 36 + data
+            
+            wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
+                b'RIFF', file_size, b'WAVE',
+                b'fmt ', 16,               # subchunk1 size
+                1,                           # PCM format
+                channels, sample_rate, byte_rate, block_align, bits_per_sample,
+                b'data', data_size
+            )
+            
+            wav_data = wav_header + pcm_data
+            
+            # Upload as new .wav blob
+            wav_blob_name = meeting.filename.replace(".pcm", ".wav")
+            wav_blob = container_client.get_blob_client(wav_blob_name)
+            wav_blob.upload_blob(wav_data, overwrite=True,
+                               content_settings=ContentSettings(content_type='audio/wav'))
+            
+            # Delete old PCM blob
+            pcm_blob.delete_blob()
+            
+            # Update DB to reference new WAV blob
+            meeting.filename = wav_blob_name
+            meeting.file_path = wav_blob_name
+            meeting.file_size = len(wav_data)
+            db.commit()
+            
+            print(f"[{mac_address}] PCM → WAV conversion complete: {wav_blob_name} ({len(wav_data)} bytes, {pcm_size / byte_rate:.1f}s audio)")
+            
+        except Exception as e:
+            import traceback
+            print(f"[{mac_address}] PCM→WAV conversion failed: {e}")
+            traceback.print_exc()
+            # Continue anyway — ai_engine ffmpeg fallback will handle it
+    
+    print(f"[{mac_address}] Triggering AI processing...")
     
     # Trigger AI processing
     background_tasks.add_task(run_background_process, meeting.id)

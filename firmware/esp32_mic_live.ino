@@ -30,7 +30,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 const char* CLOUD_HOST = "stt-premium-app.mangoisland-7c38ba74.centralindia.azurecontainerapps.io";
 const int   CLOUD_PORT = 443;
 const char* CLOUD_PATH =
-  "/api/upload?filename=live.wav&mac_address=MIC_DEVICE_01";
+  "/api/upload?filename=live.pcm&mac_address=MIC_DEVICE_01";
 
 // ================= CAMERAS =================
 const char* CAM1_HOST = "cam1.local";
@@ -185,11 +185,11 @@ void startStreaming() {
   streamClient.print(
     "POST " + String(CLOUD_PATH) + " HTTP/1.1\r\n"
     "Host: " + String(CLOUD_HOST) + "\r\n"
-    "Content-Type: audio/wav\r\n"
+    "Content-Type: application/octet-stream\r\n"
     "Transfer-Encoding: chunked\r\n\r\n"
   );
 
-  sendWavHeader(streamClient);
+  // NO WAV header — send raw PCM only. Cloud will create proper WAV.
   streaming = true;
   sendCamCommand("start");
 }

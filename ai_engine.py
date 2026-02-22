@@ -34,32 +34,48 @@ def _parse_iso_duration(duration_str: str) -> float:
 def _fix_wav_header(audio_file_path: str) -> str:
     """
     Fix WAV files with invalid RIFF/data size (e.g. 0xFFFFFFFF from ESP32 streaming).
-    The Fast Transcription REST API and many parsers reject malformed headers.
-    Returns the (possibly new) file path with a corrected header.
+    Scans for actual 'data' sub-chunk position instead of assuming offset 40.
     """
     try:
         file_size = os.path.getsize(audio_file_path)
         with open(audio_file_path, "rb") as f:
-            header = f.read(44)
+            header = f.read(min(file_size, 256))  # Read enough to find data chunk
 
         if len(header) < 44 or header[:4] != b'RIFF':
             return audio_file_path  # Not a WAV — nothing to fix
 
-        riff_size = int.from_bytes(header[4:8], 'little')
-        data_size = int.from_bytes(header[40:44], 'little')
-        correct_data_size = file_size - 44
         correct_riff_size = file_size - 8
 
-        # Check if sizes are wrong (streaming placeholder 0xFFFFFFFF, or zero, or mismatch)
+        # Find 'data' sub-chunk by scanning past RIFF header + "WAVE"
+        data_chunk_offset = None
+        pos = 12
+        while pos + 8 <= len(header):
+            chunk_id = header[pos:pos+4]
+            chunk_sz = int.from_bytes(header[pos+4:pos+8], 'little')
+            if chunk_id == b'data':
+                data_chunk_offset = pos
+                break
+            pos += 8 + chunk_sz
+            if chunk_sz % 2 == 1:
+                pos += 1  # WAV chunks are word-aligned
+
+        if data_chunk_offset is None:
+            print(f"[WAV Fix] Could not find 'data' chunk, skipping")
+            return audio_file_path
+
+        riff_size = int.from_bytes(header[4:8], 'little')
+        data_size = int.from_bytes(header[data_chunk_offset+4:data_chunk_offset+8], 'little')
+        correct_data_size = file_size - (data_chunk_offset + 8)
+
         if riff_size == correct_riff_size and data_size == correct_data_size:
             return audio_file_path  # Header already correct
 
-        print(f"[WAV Fix] Repairing header: RIFF {riff_size}→{correct_riff_size}, data {data_size}→{correct_data_size}")
-        # Patch in-place (only overwrite 8 bytes at known offsets)
+        print(f"[WAV Fix] Repairing header: RIFF {riff_size}→{correct_riff_size}, "
+              f"data @{data_chunk_offset} {data_size}→{correct_data_size}")
         with open(audio_file_path, "r+b") as f:
             f.seek(4)
             f.write(correct_riff_size.to_bytes(4, 'little'))
-            f.seek(40)
+            f.seek(data_chunk_offset + 4)
             f.write(correct_data_size.to_bytes(4, 'little'))
 
         return audio_file_path
@@ -68,12 +84,16 @@ def _fix_wav_header(audio_file_path: str) -> str:
         return audio_file_path
 
 
-def transcribe_fast_api(audio_file_path: str) -> dict | None:
+def transcribe_fast_api(audio_file_path: str, locales: list[str] | None = None, max_speakers: int = 4) -> dict | None:
     """
     Azure Speech Fast Transcription REST API — processes MUCH faster than real-time.
     Supports M4A/MP3/WAV natively with diarization. No SDK/conversion needed.
     Returns same format as ConversationTranscriber: {text, words}.
     Max file size: 300MB.
+    
+    Args:
+        locales: Language codes (e.g. ["en-US", "hi-IN"]). Defaults to ["en-US", "hi-IN"].
+        max_speakers: Maximum expected speakers (2-10). Used for diarization + fallback heuristic.
     """
     if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
         print("[FastTranscribe] Azure credentials missing")
@@ -83,9 +103,17 @@ def transcribe_fast_api(audio_file_path: str) -> dict | None:
     url = (f"https://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com"
            f"/speechtotext/transcriptions:transcribe?api-version=2024-11-15")
 
+    # Use provided locales or default to English + Hindi for bilingual/code-switching support
+    if not locales:
+        locales = ["en-US", "hi-IN"]
+    
+    # Clamp max_speakers to reasonable range
+    max_speakers = max(2, min(max_speakers, 10))
+    
     definition = {
-        "locales": ["en-US"],
-        "diarization": {"maxSpeakers": 10}
+        "locales": locales,
+        "diarizationSettings": {"minSpeakers": 1, "maxSpeakers": max_speakers},
+        "profanityFilterMode": "None"
     }
 
     t_start = time.time()
@@ -99,11 +127,21 @@ def transcribe_fast_api(audio_file_path: str) -> dict | None:
     # Fix malformed WAV headers (e.g. ESP32 streaming with 0xFFFFFFFF sizes)
     audio_file_path = _fix_wav_header(audio_file_path)
 
-    print(f"[FastTranscribe] Starting for {audio_file_path} ({file_size} bytes)...")
+    # Detect correct MIME type for the audio file
+    ext = os.path.splitext(audio_file_path)[1].lower()
+    mime_map = {
+        ".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg", ".flac": "audio/flac", ".webm": "audio/webm",
+        ".mp4": "audio/mp4", ".aac": "audio/aac",
+    }
+    audio_mime = mime_map.get(ext, "audio/wav")
+
+    print(f"[FastTranscribe] Starting for {audio_file_path} ({file_size} bytes, MIME={audio_mime})...")
+    print(f"[FastTranscribe] Definition: {json.dumps(definition)}")
 
     with open(audio_file_path, "rb") as audio_file:
         files = {
-            "audio": (os.path.basename(audio_file_path), audio_file, "application/octet-stream"),
+            "audio": (os.path.basename(audio_file_path), audio_file, audio_mime),
             "definition": (None, json.dumps(definition), "application/json"),
         }
         resp = requests.post(
@@ -115,29 +153,45 @@ def transcribe_fast_api(audio_file_path: str) -> dict | None:
 
     if resp.status_code != 200:
         print(f"[FastTranscribe] HTTP {resp.status_code}: {resp.text[:500]}")
+        # Log helpful troubleshooting info
+        if resp.status_code == 404:
+            print(f"[FastTranscribe] 404 — region '{AZURE_SPEECH_REGION}' may not support Fast Transcription. Try 'eastus' or 'westeurope'.")
+        elif resp.status_code == 400:
+            print(f"[FastTranscribe] 400 — definition JSON may be malformed. Sent: {json.dumps(definition)}")
         return None
 
     result = resp.json()
     phrases = result.get("phrases", [])
+    combined = result.get("combinedPhrases", [])
     t_elapsed = time.time() - t_start
     print(f"[FastTranscribe] Completed in {t_elapsed:.1f}s ({len(phrases)} segments)")
+    print(f"[FastTranscribe] Response top-level keys: {list(result.keys())}")
 
-    # Debug: log first phrase structure to understand API response format
+    # Debug: log first phrase structure and check if diarization returned speaker data
+    has_speaker_data = False
     if phrases:
         sample = {k: v for k, v in phrases[0].items() if k != 'words'}
-        print(f"[FastTranscribe] Sample phrase keys: {sample}")
+        print(f"[FastTranscribe] Sample phrase: {sample}")
+        has_speaker_data = "speaker" in phrases[0]
+        if not has_speaker_data:
+            print(f"[FastTranscribe] WARNING: No 'speaker' key — diarizationSettings may not have been accepted")
+            # Still return the transcript (without speaker labels) rather than falling
+            # back to the 10x slower ConversationTranscriber.  Tier 3-style gap heuristic
+            # will be applied below to infer speakers.
+            print(f"[FastTranscribe] Applying silence-gap speaker heuristic to Fast API results")
 
     all_results = []
     full_text = []
     for phrase in phrases:
         text = phrase.get("text", "")
 
-        # Speaker: API returns integer (1-based). 0 or missing = unknown.
+        # Speaker: API returns integer (1-based typically, but 0 for single-speaker audio).
+        # None = key missing entirely = truly unknown  (will be patched by gap heuristic below).
         speaker_num = phrase.get("speaker")
-        if speaker_num is not None and speaker_num > 0:
-            speaker_id = f"Guest-{speaker_num}"
+        if speaker_num is not None:
+            speaker_id = f"Guest-{max(speaker_num, 1)}"
         else:
-            speaker_id = "Unknown"
+            speaker_id = None  # Mark for gap heuristic
 
         # Timestamps: API may return offsetMilliseconds/durationMilliseconds (ints)
         # OR offset/duration (ISO 8601 strings like "PT1M30.5S"). Handle both.
@@ -155,7 +209,41 @@ def transcribe_fast_api(audio_file_path: str) -> dict | None:
             "end": round(start_s + dur_s, 2)
         }
         all_results.append(segment)
-        full_text.append(f"{speaker_id}: {text}")
+
+    # If diarization data was missing, apply improved silence-gap heuristic
+    if not has_speaker_data and all_results:
+        # Adaptive gap threshold: analyze actual gaps to pick a smart threshold
+        gaps = []
+        for i in range(1, len(all_results)):
+            gap = all_results[i]["start"] - all_results[i-1]["end"]
+            if gap > 0.3:  # Only consider meaningful gaps
+                gaps.append(gap)
+        
+        if gaps:
+            # Use median gap * 2 as threshold (catches natural pauses vs speaker changes)
+            sorted_gaps = sorted(gaps)
+            median_gap = sorted_gaps[len(sorted_gaps) // 2]
+            SPEAKER_CHANGE_GAP = max(2.0, min(median_gap * 2.5, 5.0))
+            print(f"[FastTranscribe] Adaptive gap threshold: {SPEAKER_CHANGE_GAP:.2f}s (median gap: {median_gap:.2f}s, {len(gaps)} gaps analyzed)")
+        else:
+            SPEAKER_CHANGE_GAP = 2.0
+        
+        # Cycle through up to max_speakers using the gap heuristic
+        # max_speakers=2 for known podcasts, max_speakers=4 for live ESP32 meetings
+        current_speaker_idx = 1
+        prev_end = 0
+        for seg in all_results:
+            if seg["start"] - prev_end > SPEAKER_CHANGE_GAP and prev_end > 0:
+                current_speaker_idx = (current_speaker_idx % max_speakers) + 1
+            seg["speaker"] = f"Guest-{current_speaker_idx}"
+            prev_end = seg["end"]
+        
+        # Count actual speakers assigned
+        unique_speakers = set(seg["speaker"] for seg in all_results)
+        print(f"[FastTranscribe] Heuristic assigned {len(unique_speakers)} speakers: {unique_speakers}")
+
+    for seg in all_results:
+        full_text.append(f"{seg['speaker']}: {seg['word']}")
 
     if not full_text:
         print("[FastTranscribe] No segments returned")
@@ -179,7 +267,7 @@ def convert_to_wav(input_path: str) -> str:
         print(f"ERROR: Audio conversion failed: {e}")
         return input_path # Try original
 
-def transcribe_with_azure(audio_file_path: str):
+def transcribe_with_azure(audio_file_path: str, locales: list[str] | None = None, max_speakers: int = 4):
     """
     Transcribes audio using Azure Speech SDK with Diarization.
     Tries Fast Transcription REST API first (much faster), falls back to ConversationTranscriber.
@@ -188,7 +276,7 @@ def transcribe_with_azure(audio_file_path: str):
     
     # === Try Fast Transcription API first (processes in seconds, not real-time) ===
     try:
-        fast_result = transcribe_fast_api(audio_file_path)
+        fast_result = transcribe_fast_api(audio_file_path, locales=locales, max_speakers=max_speakers)
         if fast_result and fast_result.get("words"):
             return fast_result
         print("[FastTranscribe] No results, falling back to ConversationTranscriber...")
@@ -196,18 +284,21 @@ def transcribe_with_azure(audio_file_path: str):
         print(f"[FastTranscribe] Error ({e}), falling back to ConversationTranscriber...")
     
     # === Fallback: ConversationTranscriber (real-time processing) ===
+    # ALWAYS re-encode through ffmpeg to get a clean PCM WAV.
+    # ESP32 live streams produce RIFF files with corrupted structure
+    # (appended chunks, embedded sub-headers, wrong sizes) that cause
+    # SPXERR_INVALID_HEADER (0xa) in the Speech SDK native library.
     converted_path = None
     final_path = audio_file_path
     
     try:
-        with open(audio_file_path, "rb") as f:
-            header = f.read(4)
-            if header != b'RIFF':
-                print(f"DEBUG: Header is {header}, not RIFF. Converting to WAV...")
-                converted_path = convert_to_wav(audio_file_path)
-                final_path = converted_path
-    except:
-         pass # Let SDK handle or fail
+        print(f"DEBUG: Re-encoding {audio_file_path} through ffmpeg for ConversationTranscriber...")
+        converted_path = convert_to_wav(audio_file_path)
+        final_path = converted_path
+        if converted_path == audio_file_path:
+            print("DEBUG: ffmpeg conversion returned original file (may have failed)")
+    except Exception as conv_err:
+        print(f"DEBUG: ffmpeg re-encode failed ({conv_err}), trying original file")
          
          
     # Update audio_file_path reference for rest of function
@@ -219,7 +310,10 @@ def transcribe_with_azure(audio_file_path: str):
         return {"text": "Azure Speech Credentials Missing", "words": []}
 
     speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
-    speech_config.speech_recognition_language = "en-US"
+    # Use first locale from the list; ConversationTranscriber only supports single language
+    primary_locale = (locales[0] if locales else "en-US")
+    speech_config.speech_recognition_language = primary_locale
+    print(f"DEBUG: ConversationTranscriber language set to {primary_locale}")
     
     # Quick header check (lightweight — no full file scan)
     audio_duration_s = 0  # estimated duration in seconds (used for timeout calculation)
@@ -415,14 +509,26 @@ def transcribe_with_azure(audio_file_path: str):
              print("WARNING: Fallback transcription also yielded no results.")
              return {"text": "No speech could be recognized in this audio. Please check if the audio contains clear speech.", "words": []}
         
-        # Assign speakers using silence-gap heuristic:
-        # When there's a gap > 1.5 seconds between segments, assume speaker changed
-        SPEAKER_CHANGE_GAP = 1.5  # seconds
+        # Assign speakers using improved silence-gap heuristic:
+        # Use adaptive gap analysis + cycle through max_speakers
+        gaps = []
+        for i in range(1, len(fallback_segments)):
+            gap = fallback_segments[i]["start"] - fallback_segments[i-1]["end"]
+            if gap > 0.3:
+                gaps.append(gap)
+        
+        if gaps:
+            sorted_gaps = sorted(gaps)
+            median_gap = sorted_gaps[len(sorted_gaps) // 2]
+            SPEAKER_CHANGE_GAP = max(2.0, min(median_gap * 2.5, 5.0))
+        else:
+            SPEAKER_CHANGE_GAP = 2.0
+        
         current_speaker_idx = 1
         prev_end = 0
         for seg in fallback_segments:
             if seg["start"] - prev_end > SPEAKER_CHANGE_GAP and prev_end > 0:
-                current_speaker_idx = (current_speaker_idx % 4) + 1  # Cycle through up to 4 speakers
+                current_speaker_idx = (current_speaker_idx % max_speakers) + 1
             seg["speaker"] = f"Guest-{current_speaker_idx}"
             prev_end = seg["end"]
             all_results.append(seg)
@@ -437,6 +543,94 @@ def transcribe_with_azure(audio_file_path: str):
 
     final_text = "\n".join(full_text)
     return {"text": final_text, "words": all_results}
+
+# --- Azure AI Language (Key Phrases + Sentiment) ---
+def extract_language_insights(transcript_text: str) -> Dict[str, Any]:
+    """
+    Uses Azure AI Language to extract key phrases, sentiment, and named entities.
+    Returns dict with 'key_phrases', 'sentiment', 'entities' keys.
+    Falls back gracefully if credentials are missing or the service errors.
+    """
+    language_key = os.getenv("AZURE_LANGUAGE_KEY")
+    language_endpoint = os.getenv("AZURE_LANGUAGE_ENDPOINT")  # e.g. https://myresource.cognitiveservices.azure.com/
+
+    if not language_key or not language_endpoint:
+        print("[LanguageAI] AZURE_LANGUAGE_KEY or AZURE_LANGUAGE_ENDPOINT not set, skipping")
+        return {}
+
+    try:
+        from azure.ai.textanalytics import TextAnalyticsClient
+        from azure.core.credentials import AzureKeyCredential
+
+        client = TextAnalyticsClient(
+            endpoint=language_endpoint,
+            credential=AzureKeyCredential(language_key)
+        )
+
+        # Azure AI Language has a 5120-char limit per document; split if needed
+        max_chars = 5120
+        chunks = [transcript_text[i:i + max_chars] for i in range(0, min(len(transcript_text), max_chars * 10), max_chars)]
+
+        # --- Key Phrases ---
+        kp_response = client.extract_key_phrases(chunks)
+        all_key_phrases = []
+        for doc in kp_response:
+            if not doc.is_error:
+                all_key_phrases.extend(doc.key_phrases)
+        # Deduplicate while preserving order
+        seen = set()
+        unique_phrases = []
+        for kp in all_key_phrases:
+            if kp.lower() not in seen:
+                seen.add(kp.lower())
+                unique_phrases.append(kp)
+
+        # --- Sentiment ---
+        sent_response = client.analyze_sentiment(chunks[:1])  # Sentiment on first chunk is representative
+        overall_sentiment = "unknown"
+        confidence_scores = {}
+        for doc in sent_response:
+            if not doc.is_error:
+                overall_sentiment = doc.sentiment
+                confidence_scores = {
+                    "positive": doc.confidence_scores.positive,
+                    "neutral": doc.confidence_scores.neutral,
+                    "negative": doc.confidence_scores.negative,
+                }
+                break
+
+        # --- Named Entities ---
+        ent_response = client.recognize_entities(chunks[:3])  # First 3 chunks
+        entities = []
+        seen_entities = set()
+        for doc in ent_response:
+            if not doc.is_error:
+                for entity in doc.entities:
+                    key = (entity.text.lower(), entity.category)
+                    if key not in seen_entities:
+                        seen_entities.add(key)
+                        entities.append({
+                            "text": entity.text,
+                            "category": entity.category,
+                            "confidence": round(entity.confidence_score, 2)
+                        })
+
+        result = {
+            "key_phrases": unique_phrases[:50],  # Top 50
+            "sentiment": overall_sentiment,
+            "sentiment_scores": confidence_scores,
+            "entities": entities[:30],  # Top 30
+        }
+        print(f"[LanguageAI] Extracted {len(unique_phrases)} key phrases, sentiment={overall_sentiment}, {len(entities)} entities")
+        return result
+
+    except ImportError:
+        print("[LanguageAI] azure-ai-textanalytics not installed, skipping")
+        return {}
+    except Exception as e:
+        print(f"[LanguageAI] Error: {e}")
+        return {}
+
 
 # --- OpenAI GPT-4o (Summary) ---
 def summarize_meeting_gpt(transcript_text: str) -> Dict[str, str]:
@@ -473,7 +667,7 @@ def summarize_meeting_gpt(transcript_text: str) -> Dict[str, str]:
         return {"summary": "Summarization failed.", "action_items": f"Error: {str(e)}"}
 
 
-async def process_meeting(meeting_id: str, db):
+async def process_meeting(meeting_id: str, db, locales: list[str] | None = None, max_speakers: int = 4):
     """
     Background task to run AI pipeline (Azure Transcribe + GPT Summarize).
     """
@@ -570,13 +764,16 @@ async def process_meeting(meeting_id: str, db):
              return
 
         # 2. Transcribe (AZURE)
-        print(f"[{meeting_id}] Starting Transcription (Azure Speech)...")
+        print(f"[{meeting_id}] Starting Transcription (Azure Speech, locales={locales}, max_speakers={max_speakers})...")
         # Use sync function in thread pool if needed, or just call it (it blocks but in background task)
         # Since fastAPI background tasks run in threadpool by default? No, async def runs in event loop.
         # We should run blocking code in run_in_executor
         
+        import functools
         loop = asyncio.get_event_loop()
-        transcript_result = await loop.run_in_executor(None, transcribe_with_azure, processing_path)
+        transcript_result = await loop.run_in_executor(
+            None, functools.partial(transcribe_with_azure, processing_path, locales=locales, max_speakers=max_speakers)
+        )
         
         import json
         meeting.transcription_text = transcript_result["text"]
@@ -585,14 +782,38 @@ async def process_meeting(meeting_id: str, db):
         
         db.commit()
         
-        # 3. Summarize (GPT-4o)
-        print(f"[{meeting_id}] Starting Summarization (GPT-4o)...")
-        summary_result = await loop.run_in_executor(None, summarize_meeting_gpt, meeting.transcription_text)
+        # 3. Summarize (GPT-4o) + Azure AI Language insights (run in parallel)
+        print(f"[{meeting_id}] Starting Summarization (GPT-4o) + Language AI...")
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            future_summary = pool.submit(summarize_meeting_gpt, meeting.transcription_text)
+            future_language = pool.submit(extract_language_insights, meeting.transcription_text)
+            summary_result = future_summary.result()
+            language_result = future_language.result()
 
         meeting.summary = summary_result.get("summary", "No summary.")
         raw_actions = summary_result.get("action_items", "None.") or "None"
         meeting.action_items = json.dumps(raw_actions) if isinstance(raw_actions, list) else str(raw_actions)
-        
+
+        # Merge language insights into action_items JSON (keep summary as plain text)
+        if language_result:
+            # Build enriched metadata object
+            enriched_meta = {
+                "action_items": raw_actions,
+                "key_decisions": summary_result.get("key_decisions", []),
+                "topics_discussed": summary_result.get("topics_discussed", []),
+            }
+            if language_result.get("key_phrases"):
+                enriched_meta["key_phrases"] = language_result["key_phrases"]
+            if language_result.get("sentiment"):
+                enriched_meta["sentiment"] = language_result["sentiment"]
+                enriched_meta["sentiment_scores"] = language_result.get("sentiment_scores", {})
+            if language_result.get("entities"):
+                enriched_meta["entities"] = language_result["entities"]
+            # Store enriched data in action_items field (JSON string)
+            meeting.action_items = json.dumps(enriched_meta)
+            print(f"[{meeting_id}] Enriched with Language AI: {len(language_result.get('key_phrases', []))} phrases, sentiment={language_result.get('sentiment')}")
+
         # 4. Finalize
         meeting.status = "completed"
         meeting.session_active = False

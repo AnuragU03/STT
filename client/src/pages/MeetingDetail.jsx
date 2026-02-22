@@ -7,6 +7,7 @@ export default function MeetingDetail() {
     const [meeting, setMeeting] = useState(null);
     const [loading, setLoading] = useState(true);
     const [activeTab, setActiveTab] = useState('summary');
+    const [reprocessing, setReprocessing] = useState(false);
     const audioRef = useRef(null);
 
     useEffect(() => {
@@ -59,6 +60,26 @@ export default function MeetingDetail() {
         document.body.removeChild(a);
     };
 
+    const handleReprocess = async (maxSpeakers = 4, locales = 'en-US,hi-IN') => {
+        if (!meeting) return;
+        setReprocessing(true);
+        try {
+            await axios.post(`/api/meetings/${id}/reprocess?max_speakers=${maxSpeakers}&locales=${encodeURIComponent(locales)}`);
+            // Start polling for completion
+            const poll = setInterval(async () => {
+                const res = await axios.get(`/api/meetings/${id}`);
+                setMeeting(res.data);
+                if (res.data.status !== 'processing') {
+                    clearInterval(poll);
+                    setReprocessing(false);
+                }
+            }, 3000);
+        } catch (err) {
+            console.error('Reprocess failed:', err);
+            setReprocessing(false);
+        }
+    };
+
     if (loading) return (
         <div className="min-h-screen flex items-center justify-center" style={{ backgroundColor: '#f0f4f8' }}>
             <div className="flex flex-col items-center gap-4">
@@ -87,6 +108,54 @@ export default function MeetingDetail() {
         console.warn("Failed to parse transcription_json", e);
     }
 
+    // Parse summary (may be JSON from GPT or plain text)
+    let summaryText = '';
+    let actionItems = [];
+    let keyDecisions = [];
+    let topicsDiscussed = [];
+    try {
+        if (meeting.summary) {
+            const parsed = JSON.parse(meeting.summary);
+            summaryText = parsed.summary || meeting.summary;
+            actionItems = parsed.action_items || [];
+            keyDecisions = parsed.key_decisions || [];
+            topicsDiscussed = parsed.topics_discussed || [];
+        }
+    } catch {
+        summaryText = meeting.summary || '';
+    }
+
+    // Parse action_items (enriched JSON with Language AI insights)
+    let keyPhrases = [];
+    let sentiment = '';
+    let sentimentScores = {};
+    let entities = [];
+    try {
+        if (meeting.action_items) {
+            const parsed = JSON.parse(meeting.action_items);
+            if (parsed.key_phrases) keyPhrases = parsed.key_phrases;
+            if (parsed.sentiment) sentiment = parsed.sentiment;
+            if (parsed.sentiment_scores) sentimentScores = parsed.sentiment_scores;
+            if (parsed.entities) entities = parsed.entities;
+            // If action_items were inside the enriched JSON, use them
+            if (parsed.action_items && Array.isArray(parsed.action_items) && actionItems.length === 0) {
+                actionItems = parsed.action_items;
+            }
+        }
+    } catch {
+        // action_items is plain text, not JSON
+    }
+
+    const sentimentColors = {
+        positive: 'bg-green-100 text-green-700 border-green-200',
+        neutral: 'bg-gray-100 text-gray-700 border-gray-200',
+        negative: 'bg-red-100 text-red-700 border-red-200',
+        mixed: 'bg-yellow-100 text-yellow-700 border-yellow-200',
+    };
+    const sentimentEmoji = { positive: '😊', neutral: '😐', negative: '😟', mixed: '🤔' };
+
+    const hasInsights = keyPhrases.length > 0 || sentiment || entities.length > 0;
+
     return (
         <div className="min-h-screen p-6 md:p-12 font-sans" style={{ backgroundColor: '#f0f4f8' }}>
             <div className="max-w-6xl mx-auto">
@@ -113,9 +182,21 @@ export default function MeetingDetail() {
                         </div>
 
                         {!isImg && meeting.status === 'completed' && (
-                            <button onClick={handleExport} className="clay-btn-primary px-6 py-2 rounded-xl font-bold text-sm shadow-lg">
-                                📥 Export Transcript
-                            </button>
+                            <div className="flex gap-2 flex-wrap">
+                                <button onClick={() => handleReprocess(2, 'en-US,hi-IN')} disabled={reprocessing}
+                                    className="clay-btn px-4 py-2 rounded-xl font-bold text-xs text-slate-600 hover:text-indigo-600 disabled:opacity-50"
+                                    title="Best for podcasts / 1-on-1 conversations">
+                                    {reprocessing ? '⏳ Reprocessing...' : '🔄 2 Speakers'}
+                                </button>
+                                <button onClick={() => handleReprocess(4, 'en-US,hi-IN')} disabled={reprocessing}
+                                    className="clay-btn px-4 py-2 rounded-xl font-bold text-xs text-slate-600 hover:text-indigo-600 disabled:opacity-50"
+                                    title="Best for group meetings / live ESP32 sessions">
+                                    {reprocessing ? '⏳ Reprocessing...' : '🔄 4 Speakers'}
+                                </button>
+                                <button onClick={handleExport} className="clay-btn-primary px-6 py-2 rounded-xl font-bold text-sm shadow-lg">
+                                    📥 Export Transcript
+                                </button>
+                            </div>
                         )}
                     </div>
                 </div>
@@ -133,7 +214,15 @@ export default function MeetingDetail() {
                         ) : (
                             <div className="clay-card p-4 mb-6">
                                 <h4 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider">🎵 Audio Player</h4>
-                                <audio ref={audioRef} controls preload="metadata" src={`/api/meetings/${id}/audio`} className="w-full" />
+                                <audio ref={audioRef} controls preload="auto" className="w-full">
+                                    <source src={`/api/meetings/${id}/audio`} type={
+                                        meeting.filename?.endsWith('.m4a') ? 'audio/mp4' :
+                                        meeting.filename?.endsWith('.mp3') ? 'audio/mpeg' :
+                                        meeting.filename?.endsWith('.ogg') ? 'audio/ogg' :
+                                        meeting.filename?.endsWith('.webm') ? 'audio/webm' :
+                                        'audio/wav'
+                                    } />
+                                </audio>
                             </div>
                         )}
 
@@ -152,6 +241,14 @@ export default function MeetingDetail() {
                                 >
                                     📝 <span>Transcript</span>
                                 </button>
+                                {hasInsights && (
+                                    <button
+                                        onClick={() => setActiveTab('insights')}
+                                        className={`clay-btn p-4 flex items-center gap-3 w-full text-left ${activeTab === 'insights' ? 'active text-indigo-600' : 'text-slate-500'}`}
+                                    >
+                                        🧠 <span>AI Insights</span>
+                                    </button>
+                                )}
                                 {meeting.images && meeting.images.length > 0 && (
                                     <button
                                         onClick={() => setActiveTab('images')}
@@ -187,11 +284,69 @@ export default function MeetingDetail() {
                                                 <div className="animate-spin w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full mx-auto mb-4"></div>
                                                 <p className="text-slate-500">AI is processing your meeting...</p>
                                             </div>
-                                        ) : meeting.summary ? (
+                                        ) : summaryText ? (
                                             <div className="space-y-6">
+                                                {/* Sentiment Badge */}
+                                                {sentiment && (
+                                                    <div className={`inline-flex items-center gap-2 px-4 py-2 rounded-full border text-sm font-semibold ${sentimentColors[sentiment] || sentimentColors.neutral}`}>
+                                                        <span>{sentimentEmoji[sentiment] || '😐'}</span>
+                                                        <span className="capitalize">{sentiment}</span>
+                                                        {sentimentScores.positive !== undefined && (
+                                                            <span className="text-xs opacity-70 ml-1">
+                                                                ({Math.round((sentimentScores.positive || 0) * 100)}% pos)
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                )}
+
+                                                {/* Summary */}
                                                 <div className="clay-card p-4 bg-white">
-                                                    <p className="text-slate-700 leading-relaxed whitespace-pre-wrap">{meeting.summary}</p>
+                                                    <p className="text-slate-700 leading-relaxed whitespace-pre-wrap">{summaryText}</p>
                                                 </div>
+
+                                                {/* Action Items */}
+                                                {actionItems.length > 0 && (
+                                                    <div className="clay-card p-4 bg-white">
+                                                        <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">📋 Action Items</h3>
+                                                        <ul className="space-y-2">
+                                                            {actionItems.map((item, i) => (
+                                                                <li key={i} className="flex items-start gap-2 text-sm text-slate-600">
+                                                                    <span className="text-indigo-500 mt-0.5">●</span>
+                                                                    <span>{typeof item === 'string' ? item : item.task || item.description || JSON.stringify(item)}</span>
+                                                                </li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                )}
+
+                                                {/* Key Decisions */}
+                                                {keyDecisions.length > 0 && (
+                                                    <div className="clay-card p-4 bg-white">
+                                                        <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">⚖️ Key Decisions</h3>
+                                                        <ul className="space-y-2">
+                                                            {keyDecisions.map((item, i) => (
+                                                                <li key={i} className="flex items-start gap-2 text-sm text-slate-600">
+                                                                    <span className="text-green-500 mt-0.5">✓</span>
+                                                                    <span>{typeof item === 'string' ? item : JSON.stringify(item)}</span>
+                                                                </li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                )}
+
+                                                {/* Topics Discussed */}
+                                                {topicsDiscussed.length > 0 && (
+                                                    <div className="clay-card p-4 bg-white">
+                                                        <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">💬 Topics Discussed</h3>
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {topicsDiscussed.map((topic, i) => (
+                                                                <span key={i} className="px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full text-xs font-medium border border-indigo-100">
+                                                                    {typeof topic === 'string' ? topic : JSON.stringify(topic)}
+                                                                </span>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                )}
                                             </div>
                                         ) : (
                                             <div className="text-center py-20 text-slate-400">
@@ -242,6 +397,104 @@ export default function MeetingDetail() {
                                                 <div className="text-center py-20 text-slate-400">
                                                     <span className="text-4xl">📝</span>
                                                     <p className="mt-4">No transcript available.</p>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* AI Insights Tab */}
+                                {activeTab === 'insights' && (
+                                    <div>
+                                        <h2 className="text-2xl font-bold mb-6 text-slate-700">
+                                            🧠 AI Insights
+                                        </h2>
+
+                                        <div className="space-y-6">
+                                            {/* Sentiment Analysis */}
+                                            {sentiment && (
+                                                <div className="clay-card p-5 bg-white">
+                                                    <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider mb-4">Sentiment Analysis</h3>
+                                                    <div className="flex items-center gap-4 mb-4">
+                                                        <span className="text-4xl">{sentimentEmoji[sentiment] || '😐'}</span>
+                                                        <div>
+                                                            <span className={`inline-block px-4 py-1.5 rounded-full text-sm font-bold capitalize ${sentimentColors[sentiment] || sentimentColors.neutral}`}>
+                                                                {sentiment}
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                    {sentimentScores.positive !== undefined && (
+                                                        <div className="space-y-2 mt-3">
+                                                            {[
+                                                                { label: 'Positive', value: sentimentScores.positive, color: 'bg-green-400' },
+                                                                { label: 'Neutral', value: sentimentScores.neutral, color: 'bg-gray-400' },
+                                                                { label: 'Negative', value: sentimentScores.negative, color: 'bg-red-400' },
+                                                            ].map(({ label, value, color }) => (
+                                                                <div key={label} className="flex items-center gap-3 text-sm">
+                                                                    <span className="w-16 text-slate-500">{label}</span>
+                                                                    <div className="flex-1 bg-slate-100 rounded-full h-3 overflow-hidden">
+                                                                        <div className={`${color} h-full rounded-full transition-all`} style={{ width: `${Math.round((value || 0) * 100)}%` }} />
+                                                                    </div>
+                                                                    <span className="w-12 text-right text-slate-600 font-mono">{Math.round((value || 0) * 100)}%</span>
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+
+                                            {/* Key Phrases */}
+                                            {keyPhrases.length > 0 && (
+                                                <div className="clay-card p-5 bg-white">
+                                                    <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider mb-4">🔑 Key Phrases ({keyPhrases.length})</h3>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {keyPhrases.map((phrase, i) => (
+                                                            <span key={i} className="px-3 py-1.5 bg-gradient-to-r from-indigo-50 to-purple-50 text-indigo-700 rounded-full text-xs font-medium border border-indigo-100 shadow-sm">
+                                                                {phrase}
+                                                            </span>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {/* Named Entities */}
+                                            {entities.length > 0 && (
+                                                <div className="clay-card p-5 bg-white">
+                                                    <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider mb-4">🏷️ Named Entities ({entities.length})</h3>
+                                                    <div className="overflow-x-auto">
+                                                        <table className="w-full text-sm">
+                                                            <thead>
+                                                                <tr className="text-left text-slate-400 border-b border-slate-100">
+                                                                    <th className="pb-2 font-medium">Entity</th>
+                                                                    <th className="pb-2 font-medium">Category</th>
+                                                                    <th className="pb-2 font-medium text-right">Confidence</th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody className="divide-y divide-slate-50">
+                                                                {entities.map((ent, i) => (
+                                                                    <tr key={i} className="hover:bg-slate-50 transition-colors">
+                                                                        <td className="py-2 text-slate-700 font-medium">{ent.text}</td>
+                                                                        <td className="py-2">
+                                                                            <span className="px-2 py-0.5 bg-slate-100 text-slate-600 rounded text-xs">
+                                                                                {ent.category}
+                                                                            </span>
+                                                                        </td>
+                                                                        <td className="py-2 text-right font-mono text-slate-500">
+                                                                            {Math.round((ent.confidence_score || ent.confidence || 0) * 100)}%
+                                                                        </td>
+                                                                    </tr>
+                                                                ))}
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {/* No insights fallback */}
+                                            {!sentiment && keyPhrases.length === 0 && entities.length === 0 && (
+                                                <div className="text-center py-20 text-slate-400">
+                                                    <span className="text-4xl">🔍</span>
+                                                    <p className="mt-4">No AI insights available yet.</p>
                                                 </div>
                                             )}
                                         </div>

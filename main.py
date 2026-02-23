@@ -796,6 +796,27 @@ def get_audio(meeting_id: str, request: Request, db: Session = Depends(get_db)):
         # Download blob into memory
         blob_data = blob_client.download_blob().readall()
         
+        # If raw PCM (no RIFF header, or .pcm extension), prepend WAV header
+        if blob_data[:4] != b'RIFF' or ext == 'pcm':
+            import struct
+            pcm_size = len(blob_data) if blob_data[:4] != b'RIFF' else len(blob_data)
+            # Strip existing RIFF if somehow present on a .pcm file
+            pcm_payload = blob_data if blob_data[:4] != b'RIFF' else blob_data
+            pcm_size = len(pcm_payload)
+            sample_rate = 16000
+            channels = 1
+            bits_per_sample = 16
+            byte_rate = sample_rate * channels * (bits_per_sample // 8)
+            block_align = channels * (bits_per_sample // 8)
+            wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
+                b'RIFF', 36 + pcm_size, b'WAVE',
+                b'fmt ', 16, 1, channels, sample_rate, byte_rate, block_align, bits_per_sample,
+                b'data', pcm_size
+            )
+            blob_data = wav_header + pcm_payload
+            content_type = 'audio/wav'
+            print(f"[AudioServe] Wrapped raw PCM with WAV header: {pcm_size} PCM bytes → {len(blob_data)} WAV bytes")
+        
         # Patch WAV header if needed (fix streaming WAV from ESP32)
         if blob_data[:4] == b'RIFF' and len(blob_data) >= 44:
             # Fix RIFF size (always at offset 4)

@@ -26,6 +26,9 @@ class Meeting(Base):
     mac_address = Column(String(50), nullable=True, index=True)
     device_type = Column(String(20), default="mic")  # 'mic', 'cam1', 'cam2'
     
+    # Ownership — stores the email of the user who created this meeting
+    created_by = Column(String(255), nullable=True, index=True)  # null = device/ESP32 upload
+
     # Session tracking fields
     session_active = Column(Boolean, default=True, index=True)  # Is this session currently recording?
     session_end_timestamp = Column(DateTime(timezone=True), nullable=True)  # When did the session end?

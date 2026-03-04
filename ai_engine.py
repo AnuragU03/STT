@@ -250,9 +250,9 @@ def transcribe_fast_api(audio_file_path: str, locales: list[str] | None = None, 
     url = (f"https://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com"
            f"/speechtotext/transcriptions:transcribe?api-version=2024-11-15")
 
-    # Use provided locales or default to English + Hindi for bilingual/code-switching support
+    # Use provided locales or default to English only (bilingual is opt-in via reprocess)
     if not locales:
-        locales = ["en-US", "hi-IN"]
+        locales = ["en-US"]
     
     # Clamp max_speakers to reasonable range
     max_speakers = max(2, min(max_speakers, 10))
@@ -847,10 +847,14 @@ def summarize_meeting_gpt(transcript_text: str) -> Dict[str, str]:
                 )},
                 {"role": "user", "content": (
                     "Analyze this meeting transcript and return a json object with these keys:\n"
-                    "- \"summary\": A clear 3-5 sentence executive summary of what was discussed\n"
-                    "- \"action_items\": An array of specific, actionable next steps with owners if identifiable\n"
-                    "- \"key_decisions\": An array of important decisions that were made\n"
-                    "- \"topics_discussed\": An array of main topics/themes covered\n\n"
+                    "- \"summary\": A clear 3-5 sentence executive summary in English\n"
+                    "- \"summary_hindi\": The same executive summary translated to Hindi (Devanagari script)\n"
+                    "- \"action_items\": An array of specific, actionable next steps with owners if identifiable (in English)\n"
+                    "- \"action_items_hindi\": The same action items array translated to Hindi (Devanagari script)\n"
+                    "- \"key_decisions\": An array of important decisions that were made (in English)\n"
+                    "- \"key_decisions_hindi\": The same key decisions array translated to Hindi (Devanagari script)\n"
+                    "- \"topics_discussed\": An array of main topics/themes covered (in English)\n"
+                    "- \"topics_discussed_hindi\": The same topics array translated to Hindi (Devanagari script)\n\n"
                     f"Transcript:\n\n{transcript_text[:50000]}"
                 )}
             ],

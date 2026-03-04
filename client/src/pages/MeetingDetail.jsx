@@ -11,6 +11,7 @@ export default function MeetingDetail() {
     const [activeTab, setActiveTab] = useState('summary');
     const [reprocessing, setReprocessing] = useState(false);
     const audioRef = useRef(null);
+    const [audioUrl, setAudioUrl] = useState(null);
 
     useEffect(() => {
         fetchMeeting();
@@ -53,6 +54,24 @@ export default function MeetingDetail() {
             clearInterval(pingInterval);
             clearTimeout(reconnectTimer);
             if (ws) ws.close();
+        };
+    }, [id]);
+
+    // Fetch audio/media as blob via axios (sends auth token)
+    useEffect(() => {
+        if (!id) return;
+        let blobUrl = null;
+
+        axios.get(`/api/meetings/${id}/audio`, { responseType: 'blob' })
+            .then(res => {
+                blobUrl = URL.createObjectURL(res.data);
+                setAudioUrl(blobUrl);
+            })
+            .catch(err => console.error('Failed to load media', err));
+
+        return () => {
+            if (blobUrl) URL.revokeObjectURL(blobUrl);
+            setAudioUrl(null);
         };
     }, [id]);
 
@@ -138,16 +157,24 @@ export default function MeetingDetail() {
 
     // Parse summary (may be JSON from GPT or plain text)
     let summaryText = '';
+    let summaryHindi = '';
     let actionItems = [];
+    let actionItemsHindi = [];
     let keyDecisions = [];
+    let keyDecisionsHindi = [];
     let topicsDiscussed = [];
+    let topicsDiscussedHindi = [];
     try {
         if (meeting.summary) {
             const parsed = JSON.parse(meeting.summary);
             summaryText = parsed.summary || meeting.summary;
+            summaryHindi = parsed.summary_hindi || '';
             actionItems = parsed.action_items || [];
+            actionItemsHindi = parsed.action_items_hindi || [];
             keyDecisions = parsed.key_decisions || [];
+            keyDecisionsHindi = parsed.key_decisions_hindi || [];
             topicsDiscussed = parsed.topics_discussed || [];
+            topicsDiscussedHindi = parsed.topics_discussed_hindi || [];
         }
     } catch {
         summaryText = meeting.summary || '';
@@ -209,21 +236,42 @@ export default function MeetingDetail() {
                             </div>
                         </div>
 
-                        {!isImg && meeting.status === 'completed' && (
+                        {!isImg && (
                             <div className="flex gap-2 flex-wrap">
-                                <button onClick={() => handleReprocess(2, 'en-US,hi-IN')} disabled={reprocessing}
-                                    className="clay-btn px-4 py-2 rounded-xl font-bold text-xs text-slate-600 hover:text-indigo-600 disabled:opacity-50"
-                                    title="Best for podcasts / 1-on-1 conversations">
-                                    {reprocessing ? '⏳ Reprocessing...' : '🔄 2 Speakers'}
-                                </button>
-                                <button onClick={() => handleReprocess(4, 'en-US,hi-IN')} disabled={reprocessing}
-                                    className="clay-btn px-4 py-2 rounded-xl font-bold text-xs text-slate-600 hover:text-indigo-600 disabled:opacity-50"
-                                    title="Best for group meetings / live ESP32 sessions">
-                                    {reprocessing ? '⏳ Reprocessing...' : '🔄 4 Speakers'}
-                                </button>
-                                <button onClick={handleExport} className="clay-btn-primary px-6 py-2 rounded-xl font-bold text-sm shadow-lg">
-                                    📥 Export Transcript
-                                </button>
+                                {/* Stuck processing or failed — prominent reprocess button */}
+                                {(meeting.status === 'processing' || meeting.status === 'failed') && (
+                                    <button onClick={() => handleReprocess(4, 'en-US')} disabled={reprocessing}
+                                        className="clay-btn-primary px-5 py-2 rounded-xl font-bold text-sm shadow-lg disabled:opacity-50 flex items-center gap-2"
+                                        title="Re-run transcription + AI pipeline (English)">
+                                        {reprocessing ? (
+                                            <><div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></div> Reprocessing...</>
+                                        ) : (
+                                            <><span>🔄</span> Reprocess Now</>
+                                        )}
+                                    </button>
+                                )}
+                                {meeting.status === 'completed' && (
+                                    <>
+                                        <button onClick={() => handleReprocess(2, 'en-US')} disabled={reprocessing}
+                                            className="clay-btn px-4 py-2 rounded-xl font-bold text-xs text-slate-600 hover:text-indigo-600 disabled:opacity-50"
+                                            title="English only — Best for podcasts / 1-on-1">
+                                            {reprocessing ? '⏳ Reprocessing...' : '🔄 2 Speakers'}
+                                        </button>
+                                        <button onClick={() => handleReprocess(4, 'en-US')} disabled={reprocessing}
+                                            className="clay-btn px-4 py-2 rounded-xl font-bold text-xs text-slate-600 hover:text-indigo-600 disabled:opacity-50"
+                                            title="English only — Best for group meetings">
+                                            {reprocessing ? '⏳ Reprocessing...' : '🔄 4 Speakers'}
+                                        </button>
+                                        <button onClick={() => handleReprocess(4, 'en-US,hi-IN')} disabled={reprocessing}
+                                            className="clay-btn px-4 py-2 rounded-xl font-bold text-xs text-orange-600 hover:text-orange-700 disabled:opacity-50 border border-orange-200"
+                                            title="English + Hindi bilingual transcription">
+                                            {reprocessing ? '⏳ Reprocessing...' : '🇮🇳 Bilingual'}
+                                        </button>
+                                        <button onClick={handleExport} className="clay-btn-primary px-6 py-2 rounded-xl font-bold text-sm shadow-lg">
+                                            📥 Export Transcript
+                                        </button>
+                                    </>
+                                )}
                             </div>
                         )}
                     </div>
@@ -237,20 +285,26 @@ export default function MeetingDetail() {
                         {/* Audio Player / Image Preview */}
                         {isImg ? (
                             <div className="clay-card p-2 overflow-hidden mb-6">
-                                <img src={`/api/meetings/${id}/audio`} alt={meeting.filename} className="w-full h-auto rounded-xl" />
+                                {audioUrl ? (
+                                    <img src={audioUrl} alt={meeting.filename} className="w-full h-auto rounded-xl" />
+                                ) : (
+                                    <div className="flex items-center justify-center py-12">
+                                        <div className="animate-spin w-5 h-5 border-2 border-indigo-400 border-t-transparent rounded-full mr-2"></div>
+                                        <span className="text-sm text-slate-400">Loading image...</span>
+                                    </div>
+                                )}
                             </div>
                         ) : (
                             <div className="clay-card p-4 mb-6">
                                 <h4 className="text-xs font-bold text-slate-400 uppercase mb-3 tracking-wider">🎵 Audio Player</h4>
-                                <audio ref={audioRef} controls preload="auto" className="w-full">
-                                    <source src={`/api/meetings/${id}/audio`} type={
-                                        meeting.filename?.endsWith('.m4a') ? 'audio/mp4' :
-                                        meeting.filename?.endsWith('.mp3') ? 'audio/mpeg' :
-                                        meeting.filename?.endsWith('.ogg') ? 'audio/ogg' :
-                                        meeting.filename?.endsWith('.webm') ? 'audio/webm' :
-                                        'audio/wav'
-                                    } />
-                                </audio>
+                                {audioUrl ? (
+                                    <audio ref={audioRef} controls preload="auto" className="w-full" src={audioUrl} />
+                                ) : (
+                                    <div className="flex items-center justify-center py-4">
+                                        <div className="animate-spin w-5 h-5 border-2 border-indigo-400 border-t-transparent rounded-full mr-2"></div>
+                                        <span className="text-sm text-slate-400">Loading audio...</span>
+                                    </div>
+                                )}
                             </div>
                         )}
 
@@ -327,10 +381,19 @@ export default function MeetingDetail() {
                                                     </div>
                                                 )}
 
-                                                {/* Summary */}
+                                                {/* Summary - English */}
                                                 <div className="clay-card p-4 bg-white">
+                                                    <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">🇬🇧 English</h3>
                                                     <p className="text-slate-700 leading-relaxed whitespace-pre-wrap">{summaryText}</p>
                                                 </div>
+
+                                                {/* Summary - Hindi */}
+                                                {summaryHindi && (
+                                                    <div className="clay-card p-4 bg-orange-50/50 border border-orange-100">
+                                                        <h3 className="text-xs font-bold text-orange-400 uppercase tracking-wider mb-2">🇮🇳 हिन्दी</h3>
+                                                        <p className="text-slate-700 leading-relaxed whitespace-pre-wrap">{summaryHindi}</p>
+                                                    </div>
+                                                )}
 
                                                 {/* Action Items */}
                                                 {actionItems.length > 0 && (
@@ -340,6 +403,21 @@ export default function MeetingDetail() {
                                                             {actionItems.map((item, i) => (
                                                                 <li key={i} className="flex items-start gap-2 text-sm text-slate-600">
                                                                     <span className="text-indigo-500 mt-0.5">●</span>
+                                                                    <span>{typeof item === 'string' ? item : item.task || item.description || JSON.stringify(item)}</span>
+                                                                </li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                )}
+
+                                                {/* Action Items - Hindi */}
+                                                {actionItemsHindi.length > 0 && (
+                                                    <div className="clay-card p-4 bg-orange-50/50 border border-orange-100">
+                                                        <h3 className="text-sm font-bold text-orange-400 uppercase tracking-wider mb-3">📋 कार्य सूची (हिन्दी)</h3>
+                                                        <ul className="space-y-2">
+                                                            {actionItemsHindi.map((item, i) => (
+                                                                <li key={i} className="flex items-start gap-2 text-sm text-slate-600">
+                                                                    <span className="text-orange-500 mt-0.5">●</span>
                                                                     <span>{typeof item === 'string' ? item : item.task || item.description || JSON.stringify(item)}</span>
                                                                 </li>
                                                             ))}
@@ -362,6 +440,21 @@ export default function MeetingDetail() {
                                                     </div>
                                                 )}
 
+                                                {/* Key Decisions - Hindi */}
+                                                {keyDecisionsHindi.length > 0 && (
+                                                    <div className="clay-card p-4 bg-orange-50/50 border border-orange-100">
+                                                        <h3 className="text-sm font-bold text-orange-400 uppercase tracking-wider mb-3">⚖️ मुख्य निर्णय (हिन्दी)</h3>
+                                                        <ul className="space-y-2">
+                                                            {keyDecisionsHindi.map((item, i) => (
+                                                                <li key={i} className="flex items-start gap-2 text-sm text-slate-600">
+                                                                    <span className="text-orange-500 mt-0.5">✓</span>
+                                                                    <span>{typeof item === 'string' ? item : JSON.stringify(item)}</span>
+                                                                </li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                )}
+
                                                 {/* Topics Discussed */}
                                                 {topicsDiscussed.length > 0 && (
                                                     <div className="clay-card p-4 bg-white">
@@ -369,6 +462,20 @@ export default function MeetingDetail() {
                                                         <div className="flex flex-wrap gap-2">
                                                             {topicsDiscussed.map((topic, i) => (
                                                                 <span key={i} className="px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full text-xs font-medium border border-indigo-100">
+                                                                    {typeof topic === 'string' ? topic : JSON.stringify(topic)}
+                                                                </span>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                {/* Topics Discussed - Hindi */}
+                                                {topicsDiscussedHindi.length > 0 && (
+                                                    <div className="clay-card p-4 bg-orange-50/50 border border-orange-100">
+                                                        <h3 className="text-sm font-bold text-orange-400 uppercase tracking-wider mb-3">💬 चर्चा विषय (हिन्दी)</h3>
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {topicsDiscussedHindi.map((topic, i) => (
+                                                                <span key={i} className="px-3 py-1 bg-orange-50 text-orange-600 rounded-full text-xs font-medium border border-orange-200">
                                                                     {typeof topic === 'string' ? topic : JSON.stringify(topic)}
                                                                 </span>
                                                             ))}
@@ -546,17 +653,24 @@ export default function MeetingDetail() {
                                                 {meeting.images.map((img) => (
                                                     <div key={img.id} className="clay-card p-2 overflow-hidden group">
                                                         <div className="aspect-video relative overflow-hidden rounded-xl">
-                                                            <img
-                                                                src={`/api/images/${img.filename}`}
-                                                                alt={img.device_type}
-                                                                className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
-                                                            />
+                                                            {img.url ? (
+                                                                <img
+                                                                    src={img.url}
+                                                                    alt={img.device_type}
+                                                                    className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                                                                    loading="lazy"
+                                                                />
+                                                            ) : (
+                                                                <div className="w-full h-full flex items-center justify-center bg-slate-100 rounded-xl min-h-[120px]">
+                                                                    <span className="text-slate-400 text-sm">Image unavailable</span>
+                                                                </div>
+                                                            )}
                                                             <div className="absolute top-2 left-2 bg-black/60 backdrop-blur-sm px-2 py-1 rounded-md text-xs font-mono text-white flex items-center gap-1 border border-white/10">
                                                                 {img.device_type === 'cam1' ? '📸 Cam 1' : img.device_type === 'cam2' ? '📸 Cam 2' : '📷 Unknown'}
                                                             </div>
                                                         </div>
                                                         <div className="p-3">
-                                                            <span className="text-xs text-slate-500">{new Date(img.upload_timestamp).toLocaleString()}</span>
+                                                            <span className="text-xs text-slate-500">{new Date(img.upload_timestamp + (img.upload_timestamp?.endsWith('Z') ? '' : 'Z')).toLocaleString()}</span>
                                                         </div>
                                                     </div>
                                                 ))}

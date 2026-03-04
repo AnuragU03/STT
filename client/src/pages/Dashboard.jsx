@@ -2,10 +2,14 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { useDropzone } from 'react-dropzone';
+import { useMsal } from '@azure/msal-react';
+import { useCurrentUser } from '../auth/useAuthFetch';
 
 export default function Dashboard() {
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
+    const { instance } = useMsal();
+    const currentUser = useCurrentUser();
 
     // =================== STATE ===================
     const [meetings, setMeetings] = useState([]);
@@ -388,12 +392,32 @@ export default function Dashboard() {
                     </nav>
                 </div>
 
-                <div className="clay-card p-4 hidden lg:flex items-center gap-3 cursor-pointer hover:scale-105 transition-transform">
-                    <div className="w-10 h-10 rounded-full bg-indigo-200 flex items-center justify-center text-indigo-800 font-bold text-sm">VK</div>
-                    <div className="flex flex-col">
-                        <span className="text-sm font-bold text-slate-700">Vinshanks</span>
-                        <span className="text-xs text-slate-500">Enterprise Plan</span>
+                <div className="clay-card p-4 hidden lg:flex items-center gap-3 group relative">
+                    <div className="w-10 h-10 rounded-full bg-indigo-200 flex items-center justify-center text-indigo-800 font-bold text-sm">
+                        {currentUser?.initials || 'U'}
                     </div>
+                    <div className="flex flex-col flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                            <span className="text-sm font-bold text-slate-700 truncate">{currentUser?.name || 'User'}</span>
+                            {currentUser?.role === 'owner' && (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-700 uppercase tracking-wide">Owner</span>
+                            )}
+                            {currentUser?.role === 'admin' && (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-100 text-indigo-700 uppercase tracking-wide">Admin</span>
+                            )}
+                        </div>
+                        <span className="text-xs text-slate-500 truncate">{currentUser?.email || ''}</span>
+                    </div>
+                    <button
+                        onClick={() => instance.logoutRedirect({
+                            account: instance.getActiveAccount(),
+                            postLogoutRedirectUri: window.location.origin,
+                        })}
+                        className="text-slate-400 hover:text-red-500 transition-colors text-sm ml-1"
+                        title="Sign out"
+                    >
+                        🚪
+                    </button>
                 </div>
             </aside>
 

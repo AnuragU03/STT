@@ -2,6 +2,7 @@ import os
 import shutil
 import uuid
 import json
+import struct
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -9,6 +10,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Backgroun
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
@@ -17,6 +19,8 @@ import database
 import ai_engine
 from pydantic import BaseModel
 import asyncio
+import httpx
+from jose import jwt, JWTError
 
 # Load env
 load_dotenv(".env.secrets")
@@ -39,14 +43,119 @@ if APPINSIGHTS_CONN_STR:
 else:
     print("⏭️  Application Insights not configured (set APPINSIGHTS_CONNECTION_STRING to enable)")
 
-# CORS
+# CORS — production origins only; set CORS_EXTRA_ORIGINS env var (comma-separated) for dev/localhost
+_cors_origins = ["https://meetmind.app", "https://www.meetmind.app", "https://stt-premium-app.mangoisland-7c38ba74.centralindia.azurecontainerapps.io"]
+_extra = os.getenv("CORS_EXTRA_ORIGINS", "")
+if _extra:
+    _cors_origins.extend([o.strip() for o in _extra.split(",") if o.strip()])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://meetmind.app", "https://www.meetmind.app", "http://localhost:5173", "http://localhost:3000", "http://localhost:8000", "https://stt-premium-app.mangoisland-7c38ba74.centralindia.azurecontainerapps.io"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =================== Entra ID (Azure AD) Auth ===================
+AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "3de8d03b-a1c9-4ad8-8553-604e842eb7ce")
+# Multi-tenant: use the 'common' JWKS endpoint — keys are shared across all tenants
+JWKS_URL = "https://login.microsoftonline.com/common/discovery/v2.0/keys"
+# Issuer is validated dynamically per-token (each tenant has its own issuer)
+
+# Role-based access control
+# Owner = manager / company owner — full access to all data
+# Admin = developer — full access to all data
+# User  = regular authenticated user — sees only their own meetings
+# Set OWNER_EMAILS and ADMIN_EMAILS env vars (comma-separated) to grant elevated access
+OWNER_EMAILS = [e.strip() for e in os.getenv("OWNER_EMAILS", "").lower().split(",") if e.strip()]
+ADMIN_EMAILS = [e.strip() for e in os.getenv("ADMIN_EMAILS", "").lower().split(",") if e.strip()]
+
+_jwks_cache: dict | None = None
+_jwks_cache_time: datetime | None = None
+
+security_scheme = HTTPBearer(auto_error=False)
+
+async def _get_jwks() -> dict:
+    """Fetch and cache Microsoft's public signing keys (JWKS). Refresh every 24h."""
+    global _jwks_cache, _jwks_cache_time
+    if _jwks_cache and _jwks_cache_time and (datetime.utcnow() - _jwks_cache_time) < timedelta(hours=24):
+        return _jwks_cache
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(JWKS_URL, timeout=10)
+            resp.raise_for_status()
+            _jwks_cache = resp.json()
+            _jwks_cache_time = datetime.utcnow()
+            print(f"🔑 Fetched JWKS from Entra ID ({len(_jwks_cache.get('keys', []))} keys)")
+            return _jwks_cache
+    except Exception as e:
+        print(f"⚠️  Failed to fetch JWKS: {e}")
+        if _jwks_cache:
+            return _jwks_cache  # Use stale cache if fetch fails
+        raise HTTPException(status_code=503, detail="Auth service unavailable")
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security_scheme)) -> dict:
+    """
+    FastAPI dependency that verifies a Microsoft Entra ID Bearer token.
+    Returns the decoded JWT claims (name, preferred_username, oid, etc.).
+    """
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing authorization header")
+
+    token = credentials.credentials
+    jwks = await _get_jwks()
+
+    try:
+        # Decode header to find the signing key
+        unverified_header = jwt.get_unverified_header(token)
+        kid = unverified_header.get("kid")
+
+        # Find the matching key
+        rsa_key = None
+        for key in jwks.get("keys", []):
+            if key["kid"] == kid:
+                rsa_key = key
+                break
+
+        if not rsa_key:
+            raise HTTPException(status_code=401, detail="Token signing key not found")
+
+        # Verify and decode (ID token has aud=CLIENT_ID)
+        # Multi-tenant: issuer varies per tenant, so we verify it manually after decoding
+        payload = jwt.decode(
+            token,
+            rsa_key,
+            algorithms=["RS256"],
+            audience=AZURE_CLIENT_ID,
+            options={"verify_at_hash": False, "verify_iss": False},
+        )
+
+        # Validate issuer matches Microsoft's pattern: https://login.microsoftonline.com/{tid}/v2.0
+        token_issuer = payload.get("iss", "")
+        token_tid = payload.get("tid", "")
+        expected_issuer = f"https://login.microsoftonline.com/{token_tid}/v2.0"
+        if token_issuer != expected_issuer:
+            raise HTTPException(status_code=401, detail=f"Invalid token issuer: {token_issuer}")
+
+        # Tag role: owner > admin > user
+        email = payload.get("preferred_username", payload.get("email", "")).lower().strip()
+        if email in OWNER_EMAILS:
+            payload["role"] = "owner"
+        elif email in ADMIN_EMAILS:
+            payload["role"] = "admin"
+        else:
+            payload["role"] = "user"
+        payload["is_admin"] = payload["role"] in ("owner", "admin")
+
+        return payload
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.JWTClaimsError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid claims: {e}")
+    except JWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 # =================== WebSocket Manager ===================
 class ConnectionManager:
@@ -110,32 +219,45 @@ models.Base.metadata.create_all(bind=database.engine)
 print("✅ Database tables ready")
 
 # --- Auto-Migration for Schema Updates ---
-# Only needed for persistent databases (Azure SQL / file-based SQLite).
-# In-memory SQLite creates fresh tables from models every time, so skip migrations.
-if database.AZURE_SQL_CONNECTION_STRING:
-    from sqlalchemy import text, inspect
-    try:
-        with database.engine.connect() as conn:
-            inspector = inspect(database.engine)
-            columns = [c['name'] for c in inspector.get_columns('meetings')]
-            if 'file_size' not in columns:
-                conn.execute(text("ALTER TABLE meetings ADD COLUMN file_size FLOAT DEFAULT 0"))
-            if 'mac_address' not in columns:
-                conn.execute(text("ALTER TABLE meetings ADD COLUMN mac_address VARCHAR"))
-            if 'device_type' not in columns:
-                conn.execute(text("ALTER TABLE meetings ADD COLUMN device_type VARCHAR DEFAULT 'mic'"))
-            if 'session_active' not in columns:
-                if 'mssql' in str(database.engine.url):
-                    conn.execute(text("ALTER TABLE meetings ADD session_active BIT DEFAULT 1"))
-                else:
-                    conn.execute(text("ALTER TABLE meetings ADD COLUMN session_active INTEGER DEFAULT 1"))
-            if 'session_end_timestamp' not in columns:
-                conn.execute(text("ALTER TABLE meetings ADD COLUMN session_end_timestamp DATETIME"))
+# For ALL database types: if restoring from an old snapshot/backup,
+# create_all won't add new columns to existing tables. We must ALTER TABLE.
+from sqlalchemy import text, inspect
+try:
+    with database.engine.connect() as conn:
+        inspector = inspect(database.engine)
+        columns = [c['name'] for c in inspector.get_columns('meetings')]
+        is_mssql = 'mssql' in str(database.engine.url)
+
+        migrations = []
+        if 'file_size' not in columns:
+            migrations.append("ALTER TABLE meetings ADD COLUMN file_size FLOAT DEFAULT 0" if not is_mssql
+                              else "ALTER TABLE meetings ADD file_size FLOAT DEFAULT 0")
+        if 'mac_address' not in columns:
+            migrations.append("ALTER TABLE meetings ADD COLUMN mac_address VARCHAR" if not is_mssql
+                              else "ALTER TABLE meetings ADD mac_address VARCHAR(50)")
+        if 'device_type' not in columns:
+            migrations.append("ALTER TABLE meetings ADD COLUMN device_type VARCHAR DEFAULT 'mic'" if not is_mssql
+                              else "ALTER TABLE meetings ADD device_type VARCHAR(20) DEFAULT 'mic'")
+        if 'session_active' not in columns:
+            migrations.append("ALTER TABLE meetings ADD session_active BIT DEFAULT 1" if is_mssql
+                              else "ALTER TABLE meetings ADD COLUMN session_active INTEGER DEFAULT 1")
+        if 'session_end_timestamp' not in columns:
+            migrations.append("ALTER TABLE meetings ADD COLUMN session_end_timestamp DATETIME" if not is_mssql
+                              else "ALTER TABLE meetings ADD session_end_timestamp DATETIME")
+        if 'created_by' not in columns:
+            migrations.append("ALTER TABLE meetings ADD COLUMN created_by VARCHAR(255)" if not is_mssql
+                              else "ALTER TABLE meetings ADD created_by NVARCHAR(255) NULL")
+
+        for stmt in migrations:
+            conn.execute(text(stmt))
+            print(f"  ✅ Migration: {stmt}")
+        if migrations:
             conn.commit()
-    except Exception as e:
-        print(f"Migration failed: {e}")
-else:
-    print("⏭️  Skipping migrations (in-memory DB — tables already match models)")
+            print(f"🔄 Applied {len(migrations)} migration(s)")
+        else:
+            print("⏭️  Schema up to date — no migrations needed")
+except Exception as e:
+    print(f"⚠️  Migration check: {e}")
 # ----------------------------------------
 
 # Dependency
@@ -157,6 +279,7 @@ ALLOWED_MIME_TYPES = {
     "video/webm", "video/ogg", "video/quicktime", "video/x-msvideo",
     "image/jpeg", "image/png", "image/jpg",
 }
+MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "300"))  # Default 300 MB
 
 # --- Background Tasks ---
 # process_meeting_task moved to ai_engine.py as process_meeting
@@ -172,6 +295,26 @@ if hasattr(database, 'save_db_to_blob'):
 @app.get("/api/info")
 def info():
     return {"status": "ok", "version": "2.0.0", "service": "SonicScribe Enterprise"}
+
+def _can_access_meeting(user: dict, meeting) -> bool:
+    """Check if a user can access a specific meeting based on role."""
+    if user.get("is_admin"):
+        return True  # Owner / Admin — full access
+    # Regular user: can only access meetings they created
+    user_email = user.get("preferred_username", user.get("email", "")).lower().strip()
+    return meeting.created_by and meeting.created_by.lower().strip() == user_email
+
+@app.get("/api/me")
+async def get_current_user(user: dict = Depends(verify_token)):
+    """Return current authenticated user's profile from the Entra ID token."""
+    return {
+        "name": user.get("name", ""),
+        "email": user.get("preferred_username", user.get("email", "")),
+        "oid": user.get("oid", ""),
+        "tenant": user.get("tid", ""),
+        "role": user.get("role", "user"),
+        "is_admin": user.get("is_admin", False),
+    }
 
 # --- Azure Blob Storage ---
 from azure.storage.blob import BlobServiceClient, ContentSettings
@@ -262,6 +405,58 @@ def reimport_orphaned_blobs():
 
 reimport_orphaned_blobs()
 
+def reassign_orphaned_images():
+    """Link images with empty/unassigned meeting_id to the closest meeting by timestamp."""
+    try:
+        db = database.SessionLocal()
+        orphaned = db.query(models.MeetingImage).filter(
+            (models.MeetingImage.meeting_id == "") |
+            (models.MeetingImage.meeting_id == "unassigned") |
+            (models.MeetingImage.meeting_id == None)
+        ).all()
+        
+        if not orphaned:
+            print("📷 No orphaned images to reassign")
+            db.close()
+            return
+
+        # Get all meetings ordered by timestamp
+        meetings = db.query(models.Meeting).order_by(models.Meeting.upload_timestamp.desc()).all()
+        if not meetings:
+            print("📷 No meetings found to link orphaned images to")
+            db.close()
+            return
+
+        reassigned = 0
+        for img in orphaned:
+            # Strategy: find the meeting whose upload_timestamp is closest to (and before) the image timestamp
+            best_meeting = None
+            best_diff = None
+            for m in meetings:
+                if img.upload_timestamp and m.upload_timestamp:
+                    diff = abs((img.upload_timestamp - m.upload_timestamp).total_seconds())
+                    # Image should be within 2 hours of meeting start
+                    if diff < 7200 and (best_diff is None or diff < best_diff):
+                        best_diff = diff
+                        best_meeting = m
+            
+            if best_meeting:
+                img.meeting_id = best_meeting.id
+                reassigned += 1
+                print(f"📷 Linked image {img.filename} → meeting {best_meeting.filename} (Δ{best_diff:.0f}s)")
+
+        if reassigned > 0:
+            db.commit()
+            print(f"📷 Reassigned {reassigned} orphaned images to meetings")
+            if hasattr(database, 'save_db_to_blob'):
+                database.save_db_to_blob()
+        
+        db.close()
+    except Exception as e:
+        print(f"⚠️  Image reassignment failed: {e}")
+
+reassign_orphaned_images()
+
 # --- Re-queue meetings stuck in "processing" status after restart ---
 def requeue_stuck_meetings():
     """On startup, find meetings stuck in 'processing' and re-trigger AI processing."""
@@ -299,7 +494,7 @@ def requeue_stuck_meetings():
 requeue_stuck_meetings()
 
 @app.post("/api/transcribe")
-async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = None, db: Session = Depends(get_db)):
+async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = None, db: Session = Depends(get_db), user: dict = Depends(verify_token)):
     """
     Manual upload endpoint: saves file, creates meeting record, and kicks off
     background transcription + summarization. Returns immediately with meeting_id.
@@ -308,6 +503,10 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
     try:
         from datetime import datetime
         import json
+
+        # Validate MIME type
+        if file.content_type and file.content_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}")
 
         # 1. Save temp file
         file_ext = file.filename.split('.')[-1] if '.' in file.filename else 'wav'
@@ -319,6 +518,12 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
             shutil.copyfileobj(file.file, buffer)
         
         file_size = os.path.getsize(temp_path)
+
+        # Validate file size
+        max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        if file_size > max_bytes:
+            os.remove(temp_path)
+            raise HTTPException(status_code=413, detail=f"File too large. Max size: {MAX_UPLOAD_SIZE_MB} MB")
 
         # 2. Upload to Azure Blob Storage
         blob_name = safe_filename
@@ -335,6 +540,7 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
                 print(f"[Upload] Blob upload failed (continuing): {be}")
 
         # 3. Create Meeting record
+        user_email = user.get("preferred_username", user.get("email", "")).lower().strip()
         meeting = models.Meeting(
             id=meeting_id,
             filename=file.filename,  # Original filename for display
@@ -342,7 +548,8 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
             status="processing",
             device_type="upload",
             file_size=file_size,
-            session_active=False
+            session_active=False,
+            created_by=user_email
         )
         db.add(meeting)
         db.commit()
@@ -355,7 +562,7 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
         # Cleanup temp file after blob upload (background will download from blob)
         try:
             os.remove(temp_path)
-        except:
+        except OSError:
             pass
 
         return {
@@ -372,9 +579,9 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
                 meeting.status = "failed"
                 meeting.summary = f"Processing failed: {str(e)}"
                 db.commit()
-        except:
+        except Exception:
             pass
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Transcription failed. Please try again.")
 
 # --- AI Summary Endpoint ---
 
@@ -382,7 +589,7 @@ class SummarizeRequest(BaseModel):
     text: str
 
 @app.post("/api/summarize")
-def summarize_text(req: SummarizeRequest):
+def summarize_text(req: SummarizeRequest, user: dict = Depends(verify_token)):
     """
     Standalone endpoint to summarize transcript text using GPT-4o.
     Used by the Dashboard after transcription completes.
@@ -396,7 +603,7 @@ def summarize_text(req: SummarizeRequest):
         return result
     except Exception as e:
         print(f"Summarize endpoint failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Summarization failed. Please try again.")
 
 # --- Device Status Endpoint ---
 
@@ -702,6 +909,15 @@ def run_background_process(meeting_id: str, locales: list[str] | None = None, ma
         notify_clients("meeting_updated", {"meeting_id": meeting_id, "status": "completed"})
     except Exception as e:
         print(f"[BackgroundProcess] Error processing {meeting_id}: {e}")
+        # Mark the meeting as failed in the DB so it doesn't stay stuck as "processing"
+        try:
+            meeting = new_db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
+            if meeting:
+                meeting.status = "failed"
+                meeting.summary = f"Processing failed: {str(e)[:500]}"
+                new_db.commit()
+        except Exception as db_err:
+            print(f"[BackgroundProcess] Failed to update meeting status: {db_err}")
         notify_clients("meeting_updated", {"meeting_id": meeting_id, "status": "failed"})
     finally:
         new_db.close()
@@ -728,19 +944,52 @@ def ack(file: str, db: Session = Depends(get_db)):
     else:
         return "processing"
 @app.get("/api/meetings")
-def list_meetings(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    meetings = db.query(models.Meeting).order_by(models.Meeting.upload_timestamp.desc()).offset(skip).limit(limit).all()
+def list_meetings(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), user: dict = Depends(verify_token)):
+    query = db.query(models.Meeting)
+    # Regular users see only their own meetings; admins/owners see everything
+    if not user.get("is_admin"):
+        user_email = user.get("preferred_username", user.get("email", "")).lower().strip()
+        query = query.filter(models.Meeting.created_by == user_email)
+    meetings = query.order_by(models.Meeting.upload_timestamp.desc()).offset(skip).limit(limit).all()
     return meetings
 
 @app.get("/api/meetings/{meeting_id}")
-def get_meeting(meeting_id: str, db: Session = Depends(get_db)):
+def get_meeting(meeting_id: str, db: Session = Depends(get_db), user: dict = Depends(verify_token)):
     meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
+    if not _can_access_meeting(user, meeting):
+        raise HTTPException(status_code=403, detail="Access denied")
     
-    # Fetch associated images
+    # Fetch associated images with SAS URLs for direct browser loading
     images = db.query(models.MeetingImage).filter(models.MeetingImage.meeting_id == meeting_id).all()
-    image_list = [{"id": img.id, "filename": img.filename, "device_type": img.device_type, "timestamp": img.upload_timestamp} for img in images]
+    image_list = []
+    for img in images:
+        sas_url = None
+        if container_client and blob_service_client:
+            blob_name = os.path.basename(img.filename)
+            try:
+                blob_client = container_client.get_blob_client(blob_name)
+                if blob_client.exists():
+                    from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+                    sas_token = generate_blob_sas(
+                        account_name=blob_service_client.account_name,
+                        container_name=CONTAINER_NAME,
+                        blob_name=blob_name,
+                        account_key=blob_service_client.credential.account_key,
+                        permission=BlobSasPermissions(read=True),
+                        expiry=datetime.utcnow() + timedelta(hours=1)
+                    )
+                    sas_url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{CONTAINER_NAME}/{blob_name}?{sas_token}"
+            except Exception as e:
+                print(f"SAS generation failed for {blob_name}: {e}")
+        image_list.append({
+            "id": img.id,
+            "filename": img.filename,
+            "device_type": img.device_type,
+            "upload_timestamp": img.upload_timestamp,
+            "url": sas_url
+        })
 
     return {
         "id": meeting.id,
@@ -754,15 +1003,18 @@ def get_meeting(meeting_id: str, db: Session = Depends(get_db)):
         "duration_seconds": meeting.duration_seconds,
         "file_size": meeting.file_size,
         "mac_address": meeting.mac_address,
+        "created_by": meeting.created_by,
         "images": image_list
     }
 
 @app.get("/api/meetings/{meeting_id}/audio")
-def get_audio(meeting_id: str, request: Request, db: Session = Depends(get_db)):
+def get_audio(meeting_id: str, request: Request, db: Session = Depends(get_db), user: dict = Depends(verify_token)):
     """Stream the audio blob with range-request support for seeking."""
     meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
+    if not _can_access_meeting(user, meeting):
+        raise HTTPException(status_code=403, detail="Access denied")
 
     if not container_client:
          raise HTTPException(status_code=500, detail="Azure Storage not configured")
@@ -795,6 +1047,27 @@ def get_audio(meeting_id: str, request: Request, db: Session = Depends(get_db)):
         
         # Download blob into memory
         blob_data = blob_client.download_blob().readall()
+        
+        # If raw PCM (no RIFF header, or .pcm extension), prepend WAV header
+        if blob_data[:4] != b'RIFF' or ext == 'pcm':
+            import struct
+            pcm_size = len(blob_data) if blob_data[:4] != b'RIFF' else len(blob_data)
+            # Strip existing RIFF if somehow present on a .pcm file
+            pcm_payload = blob_data if blob_data[:4] != b'RIFF' else blob_data
+            pcm_size = len(pcm_payload)
+            sample_rate = 16000
+            channels = 1
+            bits_per_sample = 16
+            byte_rate = sample_rate * channels * (bits_per_sample // 8)
+            block_align = channels * (bits_per_sample // 8)
+            wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
+                b'RIFF', 36 + pcm_size, b'WAVE',
+                b'fmt ', 16, 1, channels, sample_rate, byte_rate, block_align, bits_per_sample,
+                b'data', pcm_size
+            )
+            blob_data = wav_header + pcm_payload
+            content_type = 'audio/wav'
+            print(f"[AudioServe] Wrapped raw PCM with WAV header: {pcm_size} PCM bytes → {len(blob_data)} WAV bytes")
         
         # Patch WAV header if needed (fix streaming WAV from ESP32)
         if blob_data[:4] == b'RIFF' and len(blob_data) >= 44:
@@ -854,10 +1127,10 @@ def get_audio(meeting_id: str, request: Request, db: Session = Depends(get_db)):
         
     except Exception as e:
          print(f"Stream Error: {e}")
-         raise HTTPException(status_code=500, detail=str(e))
+         raise HTTPException(status_code=500, detail="Failed to stream audio.")
 
 @app.get("/api/meetings/{meeting_id}/image/{image_filename}")
-def get_image(meeting_id: str, image_filename: str):
+def get_image(meeting_id: str, image_filename: str, user: dict = Depends(verify_token)):
     """Serve image from Blob"""
     if not container_client:
          raise HTTPException(status_code=500, detail="Azure Storage not configured")
@@ -888,12 +1161,13 @@ def get_image(meeting_id: str, image_filename: str):
         url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{CONTAINER_NAME}/{blob_name}?{sas_token}"
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url)
-    except:
+    except Exception as e:
+        print(f"SAS generation failed for {blob_name}: {e}")
         stream = blob_client.download_blob()
         return Response(content=stream.readall(), media_type="image/jpeg")
 
 @app.get("/api/images/{image_filename}")
-def get_image_direct(image_filename: str):
+def get_image_direct(image_filename: str, user: dict = Depends(verify_token)):
     """
     Direct image access endpoint used by Frontend.
     Supports Azure Blob with Local Fallback.
@@ -927,7 +1201,8 @@ def get_image_direct(image_filename: str):
         url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{CONTAINER_NAME}/{blob_name}?{sas_token}"
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url)
-    except:
+    except Exception as e:
+        print(f"SAS generation failed for {blob_name}: {e}")
         stream = blob_client.download_blob()
         return Response(content=stream.readall(), media_type="image/jpeg")
 
@@ -939,11 +1214,12 @@ async def upload_image(
     camera_id: str = Form(None),
     db: Session = Depends(get_db)
 ):
-    # 1. Identify Device
-    device_map = {
-        "e08cfeb530b0": "cam1",
-        "e08cfeb61a74": "cam2"
-    }
+    # 1. Identify Device — load MAC-to-camera mapping from env var or use defaults
+    # Set CAMERA_DEVICE_MAP env var as JSON, e.g. '{"e08cfeb530b0":"cam1","e08cfeb61a74":"cam2"}'
+    try:
+        device_map = json.loads(os.getenv("CAMERA_DEVICE_MAP", '{"e08cfeb530b0":"cam1","e08cfeb61a74":"cam2"}'))
+    except (json.JSONDecodeError, TypeError):
+        device_map = {}
     device_type = device_map.get(mac_address.lower(), "unknown_cam")
     
     # Also accept camera_id as a hint (e.g., "CAM_1" → "cam1")
@@ -971,27 +1247,25 @@ async def upload_image(
 
     # 3. Find Active Meeting (Session Sync)
     # Link to an ACTIVE session that is currently recording
-    # Priority: 1) Active session with same MAC, 2) Any active session within 5 min, 3) Unassigned
+    # Priority: 1) Active session with same MAC, 2) Any active session, 3) Recent session (last 30 min)
     from datetime import datetime, timedelta
     
     active_meeting = None
     
     # Try to find active session (MIC)
-    # Cameras don't start sessions, Mics do. 
-    # So we look for ANY active session with device_type="mic"
     active_meeting = db.query(models.Meeting).filter(
         models.Meeting.session_active == True,
         models.Meeting.status == "processing",
         models.Meeting.device_type == "mic"
     ).order_by(models.Meeting.upload_timestamp.desc()).first()
     
-    # If no active session, check recent ones (last 5 mins) as fallback
+    # If no active session, check recent ones (last 30 mins) as fallback
     if not active_meeting:
-        five_min_ago = datetime.utcnow() - timedelta(minutes=5)
+        thirty_min_ago = datetime.utcnow() - timedelta(minutes=30)
         active_meeting = db.query(models.Meeting).filter(
-             models.Meeting.status == "processing",
+             models.Meeting.status.in_(["processing", "completed"]),
              models.Meeting.device_type == "mic",
-             models.Meeting.upload_timestamp >= five_min_ago
+             models.Meeting.upload_timestamp >= thirty_min_ago
         ).order_by(models.Meeting.upload_timestamp.desc()).first()
     
     meeting_id = active_meeting.id if active_meeting else "unassigned"
@@ -1021,7 +1295,8 @@ def reprocess_meeting(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     locales: str | None = None,
-    max_speakers: int = 4
+    max_speakers: int = 4,
+    user: dict = Depends(verify_token)
 ):
     """
     Manually re-trigger AI processing for a meeting.
@@ -1032,6 +1307,8 @@ def reprocess_meeting(
     meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
+    if not _can_access_meeting(user, meeting):
+        raise HTTPException(status_code=403, detail="Access denied")
     
     # Allow reprocessing completed meetings too (for re-transcription with different params)
     meeting.status = "processing"
@@ -1047,7 +1324,7 @@ def reprocess_meeting(
     return {"status": "reprocessing", "id": meeting_id, "locales": locale_list or ["en-US", "hi-IN"], "max_speakers": max_speakers}
 
 @app.post("/api/meetings/{meeting_id}/end_session")
-def end_session(meeting_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def end_session(meeting_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db), user: dict = Depends(verify_token)):
     """
     Manually end a recording session.
     Marks the session as inactive so new images won't be linked to it.
@@ -1056,6 +1333,8 @@ def end_session(meeting_id: str, background_tasks: BackgroundTasks, db: Session 
     meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
+    if not _can_access_meeting(user, meeting):
+        raise HTTPException(status_code=403, detail="Access denied")
     
     from datetime import datetime
     meeting.session_active = False
@@ -1155,10 +1434,12 @@ def end_session_by_mac(mac_address: str, background_tasks: BackgroundTasks, db: 
 
 
 @app.delete("/api/meetings/{meeting_id}")
-def delete_meeting(meeting_id: str, db: Session = Depends(get_db)):
+def delete_meeting(meeting_id: str, db: Session = Depends(get_db), user: dict = Depends(verify_token)):
     meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
+    if not _can_access_meeting(user, meeting):
+        raise HTTPException(status_code=403, detail="Access denied")
     
     # Delete Audio from Blob Storage (only if no other meeting references this blob)
     if container_client and meeting.filename:
@@ -1215,10 +1496,12 @@ class RenameRequest(BaseModel):
     new_filename: str
 
 @app.patch("/api/meetings/{meeting_id}")
-def rename_meeting(meeting_id: str, request: RenameRequest, db: Session = Depends(get_db)):
+def rename_meeting(meeting_id: str, request: RenameRequest, db: Session = Depends(get_db), user: dict = Depends(verify_token)):
     meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
+    if not _can_access_meeting(user, meeting):
+        raise HTTPException(status_code=403, detail="Access denied")
     
     meeting.filename = request.new_filename
     db.commit()

@@ -20,6 +20,8 @@ dist/
 meetings.db
 uploads/
 simulate_esp32.py
+*.m4a
+Recording.m4a
 
 # Azure Configuration (contains secrets)
 containerapp.yaml

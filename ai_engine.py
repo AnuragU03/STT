@@ -31,6 +31,61 @@ def _parse_iso_duration(duration_str: str) -> float:
     return int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + float(m.group(3) or 0)
 
 
+def _ensure_wav_format(audio_file_path: str) -> str:
+    """
+    If the file is raw PCM (no RIFF header, or .pcm extension), prepend a proper
+    WAV header (16kHz, 16-bit, mono).  Returns the path to a valid WAV file.
+    """
+    try:
+        file_size = os.path.getsize(audio_file_path)
+        if file_size < 4:
+            return audio_file_path
+
+        with open(audio_file_path, "rb") as f:
+            magic = f.read(4)
+
+        is_pcm_ext = audio_file_path.lower().endswith(".pcm")
+        has_riff = magic == b'RIFF'
+
+        if has_riff and not is_pcm_ext:
+            return audio_file_path  # Already a WAV
+
+        if has_riff:
+            # .pcm extension but has RIFF — probably already converted, just return
+            return audio_file_path
+
+        # Raw PCM detected — wrap with WAV header
+        import struct
+        pcm_size = file_size
+        sample_rate = 16000
+        channels = 1
+        bits_per_sample = 16
+        byte_rate = sample_rate * channels * (bits_per_sample // 8)
+        block_align = channels * (bits_per_sample // 8)
+
+        wav_path = audio_file_path + ".wav"
+        wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
+            b'RIFF', 36 + pcm_size, b'WAVE',
+            b'fmt ', 16, 1, channels, sample_rate, byte_rate, block_align, bits_per_sample,
+            b'data', pcm_size
+        )
+
+        with open(audio_file_path, "rb") as src, open(wav_path, "wb") as dst:
+            dst.write(wav_header)
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+
+        print(f"[PCM→WAV] Wrapped {audio_file_path} → {wav_path} "
+              f"({pcm_size} bytes PCM, {os.path.getsize(wav_path)} bytes WAV)")
+        return wav_path
+    except Exception as e:
+        print(f"[PCM→WAV] Error: {e}")
+        return audio_file_path
+
+
 def _fix_wav_header(audio_file_path: str) -> str:
     """
     Fix WAV files with invalid RIFF/data size (e.g. 0xFFFFFFFF from ESP32 streaming).
@@ -188,13 +243,16 @@ def transcribe_fast_api(audio_file_path: str, locales: list[str] | None = None, 
         print("[FastTranscribe] Azure credentials missing")
         return None
 
+    # Ensure raw PCM files are wrapped with a WAV header before sending
+    audio_file_path = _ensure_wav_format(audio_file_path)
+
     import json
     url = (f"https://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com"
            f"/speechtotext/transcriptions:transcribe?api-version=2024-11-15")
 
-    # Use provided locales or default to English + Hindi for bilingual/code-switching support
+    # Use provided locales or default to English only (bilingual is opt-in via reprocess)
     if not locales:
-        locales = ["en-US", "hi-IN"]
+        locales = ["en-US"]
     
     # Clamp max_speakers to reasonable range
     max_speakers = max(2, min(max_speakers, 10))
@@ -368,20 +426,39 @@ def transcribe_fast_api(audio_file_path: str, locales: list[str] | None = None, 
     return {"text": "\n".join(full_text), "words": all_results}
 
 def convert_to_wav(input_path: str) -> str:
-    """Converts audio to 16kHz Mono PCM WAV using stats."""
+    """Converts audio to 16kHz Mono PCM WAV using ffmpeg.
+    Handles raw PCM input (no header) by specifying format explicitly."""
     output_path = input_path + ".converted.wav"
     try:
-        # ffmpeg -i input -ac 1 -ar 16000 -y output.wav
-        subprocess.run([
-            "ffmpeg", "-i", input_path, 
-            "-ac", "1", "-ar", "16000", 
-            "-y", output_path
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"DEBUG: Converted {input_path} to {output_path}")
+        # Check if the file is raw PCM (no RIFF header)
+        is_raw_pcm = False
+        with open(input_path, "rb") as f:
+            magic = f.read(4)
+            if magic != b'RIFF':
+                is_raw_pcm = True
+        
+        if is_raw_pcm or input_path.lower().endswith(".pcm"):
+            # Raw PCM: tell ffmpeg the input format explicitly
+            cmd = [
+                "ffmpeg",
+                "-f", "s16le", "-ar", "16000", "-ac", "1",  # input format
+                "-i", input_path,
+                "-ac", "1", "-ar", "16000",
+                "-y", output_path
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-i", input_path,
+                "-ac", "1", "-ar", "16000",
+                "-y", output_path
+            ]
+        
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"DEBUG: Converted {input_path} to {output_path} (raw_pcm={is_raw_pcm})")
         return output_path
     except Exception as e:
         print(f"ERROR: Audio conversion failed: {e}")
-        return input_path # Try original
+        return input_path  # Try original
 
 def transcribe_with_azure(audio_file_path: str, locales: list[str] | None = None, max_speakers: int = 4):
     """
@@ -770,10 +847,14 @@ def summarize_meeting_gpt(transcript_text: str) -> Dict[str, str]:
                 )},
                 {"role": "user", "content": (
                     "Analyze this meeting transcript and return a json object with these keys:\n"
-                    "- \"summary\": A clear 3-5 sentence executive summary of what was discussed\n"
-                    "- \"action_items\": An array of specific, actionable next steps with owners if identifiable\n"
-                    "- \"key_decisions\": An array of important decisions that were made\n"
-                    "- \"topics_discussed\": An array of main topics/themes covered\n\n"
+                    "- \"summary\": A clear 3-5 sentence executive summary in English\n"
+                    "- \"summary_hindi\": The same executive summary translated to Hindi (Devanagari script)\n"
+                    "- \"action_items\": An array of specific, actionable next steps with owners if identifiable (in English)\n"
+                    "- \"action_items_hindi\": The same action items array translated to Hindi (Devanagari script)\n"
+                    "- \"key_decisions\": An array of important decisions that were made (in English)\n"
+                    "- \"key_decisions_hindi\": The same key decisions array translated to Hindi (Devanagari script)\n"
+                    "- \"topics_discussed\": An array of main topics/themes covered (in English)\n"
+                    "- \"topics_discussed_hindi\": The same topics array translated to Hindi (Devanagari script)\n\n"
                     f"Transcript:\n\n{transcript_text[:50000]}"
                 )}
             ],
